@@ -1,0 +1,33 @@
+version: '1.0.{build}'
+skip_tags: true
+image: Visual Studio 2019
+configuration: Release
+dotnet_csproj:
+  patch: true
+  file: '**\*.csproj'
+  version: '{version}'
+  package_version: '{version}'
+  assembly_version: '{version}'
+  file_version: '{version}'
+  informational_version: '{version}'
+before_build:
+  - nuget restore
+build:
+  publish_nuget: true
+  publish_nuget_symbols: true
+  use_snupkg_format: true
+  verbosity: normal
+deploy:
+- provider: NuGet
+  name: production
+  api_key:
+    secure: AjPKw4Pp1YBZtYNAChcNCIA8fXmYWNnkTVVLJ4b42g8IyI75b+7omacZtk9YsubE
+  on:
+    branch: master
+notifications:
+  - provider: Email
+    to:
+      - '{{commitAuthorEmail}}'
+    on_build_success: true
+    on_build_failure: true
+    on_build_status_changed: true

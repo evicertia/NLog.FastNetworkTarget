@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<TargetFrameworks>net45;net46</TargetFrameworks>
+		<Company>Evicertia S.L.</Company>
+		<IsPackable>false</IsPackable>
+		<AssemblyVersion>0.0.0.0</AssemblyVersion>
+		<FileVersion>0.0.0.0</FileVersion>
+		<Version>0.0.0.0</Version>
+		<Authors>Evicertia</Authors>
+		<Copyright>Copyright Evicertia, S.L. 2010-2021</Copyright>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageProjectUrl>https://github.com/evicertia/NLog.FastNetworkTarget</PackageProjectUrl>
+		<PackageId>NLog.FastNetworkTarget.Tests</PackageId>
+		<RootNamespace>NLog.FastNetworkTarget</RootNamespace>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<PackageReference Include="NSubstitute" Version="4.2.2" />
+		<PackageReference Include="NUnit" Version="3.13.2" />
+		<PackageReference Include="NUnit3TestAdapter" Version="4.0.0" />
+	</ItemGroup>
+
+	<ItemGroup>
+	  <ProjectReference Include="..\NLog.FastNetworkTarget\NLog.FastNetworkTarget.csproj" />
+	</ItemGroup>
+</Project>
