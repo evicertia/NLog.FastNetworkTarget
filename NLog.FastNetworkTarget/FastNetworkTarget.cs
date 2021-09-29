@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Text;
 using System.Threading;
+using System.Reflection;
 using System.Net.Sockets;
 using System.ComponentModel;
 using System.Collections.Generic;
@@ -8,16 +9,18 @@ using System.Security.Authentication;
 
 using NLog.Common;
 using NLog.Layouts;
-using NLog.Targets;
 using NLog.Internal;
 using NLog.Internal.NetworkSenders;
 
-namespace NLog.FastNetworkTarget
+namespace NLog.Targets
 {
 	[Target("FastNetwork")]
 	public class FastNetworkTarget : TargetWithLayout
 	{
 		#region Fields & Properties
+
+		private static readonly MethodInfo _tryGetCachedLayoutValue = typeof(LogEventInfo).GetMethod("TryGetCachedLayoutValue", BindingFlags.NonPublic | BindingFlags.Instance);
+		private static readonly MethodInfo _renderAppendBuilder = typeof(Layout).GetMethod("RenderAppendBuilder", BindingFlags.NonPublic | BindingFlags.Instance);
 
 		private readonly IDictionary<string, LinkedListNode<NetworkSender>> _currentSenderCache = new Dictionary<string, LinkedListNode<NetworkSender>>();
 		private readonly ReusableBufferCreator _reusableEncodingBuffer = new ReusableBufferCreator(16 * 1024);
@@ -116,9 +119,12 @@ namespace NLog.FastNetworkTarget
 		#region .ctors
 
 		public FastNetworkTarget()
-		{ }
+		{
+			OptimizeBufferReuse = true;
+		}
 
 		public FastNetworkTarget(string name)
+			: this()
 		{
 			Name = name;
 		}
@@ -126,6 +132,21 @@ namespace NLog.FastNetworkTarget
 		#endregion
 
 		#region Private methods
+
+		private static bool TryGetCachedLayoutValue(LogEventInfo logEvent, Layout layout, out object text)
+		{
+			var args = new[] { layout, (object)null };
+			var result = (bool)_tryGetCachedLayoutValue.Invoke(logEvent, args);
+
+			text = args[1];
+
+			return result;
+		}
+
+		private static void RenderAppendBuilder(Layout layout, LogEventInfo logEvent, StringBuilder target, bool cacheLayoutResult = false)
+		{
+			_renderAppendBuilder.Invoke(layout, new object[] { logEvent, target, cacheLayoutResult });
+		}
 
 		private static bool TryRemove<T>(LinkedList<T> list, LinkedListNode<T> node)
 		{
@@ -304,95 +325,8 @@ namespace NLog.FastNetworkTarget
 			}
 		}
 
-		private void WriteBytesToCachedNetworkSender(string address, byte[] bytes, AsyncLogEventInfo logEvent)
-		{
-			LinkedListNode<NetworkSender> senderNode;
-
-			try
-			{
-				senderNode = GetCachedNetworkSender(address);
-			}
-			catch (Exception ex)
-			{
-				InternalLogger.Error(ex, "{0}: Failed to create sender to address: '{1}'", nameof(FastNetworkTarget), address);
-				throw;
-			}
-
-			ChunkedSend(senderNode.Value, bytes, ex => logEvent.Continuation(ex));
-		}
-
-		private void WriteBytesToNewNetworkSender(string address, byte[] bytes, AsyncLogEventInfo logEvent)
-		{
-			NetworkSender sender;
-			LinkedListNode<NetworkSender> linkedListNode;
-
-			lock (_openNetworkSenders)
-			{
-				var tooManyConnections = _openNetworkSenders.Count >= MaxConnections;
-
-				if (tooManyConnections && MaxConnections > 0)
-				{
-					switch (OnConnectionOverflow)
-					{
-						case NetworkTargetConnectionsOverflowAction.DiscardMessage:
-							InternalLogger.Warn("{0}: Discarding message otherwise to many connections.", nameof(FastNetworkTarget));
-							logEvent.Continuation(null);
-							return;
-
-						case NetworkTargetConnectionsOverflowAction.AllowNewConnnection:
-							InternalLogger.Debug("{0}: Too may connections, but this is allowed", nameof(FastNetworkTarget));
-							break;
-
-						case NetworkTargetConnectionsOverflowAction.Block:
-							while (_openNetworkSenders.Count >= MaxConnections)
-							{
-								InternalLogger.Debug("{0}: Blocking networktarget otherwhise too many connections.", nameof(FastNetworkTarget));
-								Monitor.Wait(_openNetworkSenders);
-								InternalLogger.Trace("{0}: Entered critical section.", nameof(FastNetworkTarget));
-							}
-
-							InternalLogger.Trace("{0}: Limit ok.", nameof(FastNetworkTarget));
-							break;
-					}
-				}
-
-				try
-				{
-					sender = CreateNetworkSender(address);
-				}
-				catch (Exception ex)
-				{
-					InternalLogger.Error(ex, "{0}: Failed to create sender to address: '{1}'", nameof(FastNetworkTarget), address);
-					throw;
-				}
-
-				linkedListNode = _openNetworkSenders.AddLast(sender);
-			}
-			ChunkedSend(
-				sender,
-				bytes,
-				ex =>
-				{
-					lock (_openNetworkSenders)
-					{
-						TryRemove(_openNetworkSenders, linkedListNode);
-
-						if (OnConnectionOverflow == NetworkTargetConnectionsOverflowAction.Block)
-							Monitor.PulseAll(_openNetworkSenders);
-					}
-
-					if (ex != null)
-						InternalLogger.Error(ex, "{0}: Error when sending.", nameof(FastNetworkTarget));
-
-					sender.Close(ex2 => { });
-					logEvent.Continuation(ex);
-				});
-		}
-
 		private byte[] GetBytesFromStringBuilder(char[] charBuffer, StringBuilder stringBuilder)
 		{
-			InternalLogger.Trace("{0}: Sending {1} chars", nameof(FastNetworkTarget), stringBuilder.Length);
-
 			if (stringBuilder.Length <= charBuffer.Length)
 			{
 				stringBuilder.CopyTo(0, charBuffer, 0, stringBuilder.Length);
@@ -402,17 +336,50 @@ namespace NLog.FastNetworkTarget
 			return Encoding.GetBytes(stringBuilder.ToString());
 		}
 
+		private byte[] GetBytesFromString(char[] charBuffer, string layoutMessage)
+		{
+			if (layoutMessage.Length <= charBuffer.Length)
+			{
+				layoutMessage.CopyTo(0, charBuffer, 0, layoutMessage.Length);
+				return Encoding.GetBytes(charBuffer, 0, layoutMessage.Length);
+			}
+
+			return Encoding.GetBytes(layoutMessage);
+		}
+
 		private byte[] GetBytesToWrite(LogEventInfo logEvent)
 		{
-			using (var localBuffer = _reusableEncodingBuffer.Allocate())
-			using (var localBuilder = _reusableLayoutBuilder.Allocate())
+			if (OptimizeBufferReuse)
 			{
-				localBuilder.Result.Append(Layout.Render(logEvent));
+				using (var localBuffer = _reusableEncodingBuffer.Allocate())
+				{
+					if (!NewLine && TryGetCachedLayoutValue(logEvent, Layout, out var text))
+					{
+						return GetBytesFromString(localBuffer.Result, text?.ToString() ?? string.Empty);
+					}
+					else
+					{
+						using (var localBuilder = _reusableLayoutBuilder.Allocate())
+						{
+							RenderAppendBuilder(Layout, logEvent, localBuilder.Result, false);
 
+							if (NewLine)
+								localBuilder.Result.Append(LineEnding.NewLineCharacters);
+
+							return GetBytesFromStringBuilder(localBuffer.Result, localBuilder.Result);
+						}
+					}
+				}
+			}
+			else
+			{
+				var rendered = Layout.Render(logEvent);
+				InternalLogger.Trace("NetworkTarget(Name={0}): Sending: {1}", Name, rendered);
 				if (NewLine)
-					localBuilder.Result.Append(LineEnding.NewLineCharacters);
-
-				return GetBytesFromStringBuilder(localBuffer.Result, localBuilder.Result);
+				{
+					rendered += LineEnding.NewLineCharacters;
+				}
+				return Encoding.GetBytes(rendered);
 			}
 		}
 
@@ -464,12 +431,99 @@ namespace NLog.FastNetworkTarget
 			var address = RenderLogEvent(Address, logEvent.LogEvent);
 			var bytes = GetBytesToWrite(logEvent.LogEvent);
 
-			InternalLogger.Trace("{0}: Sending to address: '{1}'", nameof(FastNetworkTarget), address);
-
 			if (KeepConnection)
-				WriteBytesToCachedNetworkSender(address, bytes, logEvent);
+			{
+				LinkedListNode<NetworkSender> senderNode;
+
+				try
+				{
+					senderNode = GetCachedNetworkSender(address);
+				}
+				catch (Exception ex)
+				{
+					InternalLogger.Error(ex, "NetworkTarget(Name={0}): Failed to create sender to address: '{1}'", Name, address);
+					throw;
+				}
+
+				ChunkedSend(
+					senderNode.Value,
+					bytes,
+					ex =>
+					{
+						if (ex != null)
+							InternalLogger.Error(ex, "NetworkTarget(Name={0}): Error when sending.", Name);
+
+						logEvent.Continuation(ex);
+					});
+			}
 			else
-				WriteBytesToNewNetworkSender(address, bytes, logEvent);
+			{
+				NetworkSender sender;
+				LinkedListNode<NetworkSender> linkedListNode;
+
+				lock (_openNetworkSenders)
+				{
+					var tooManyConnections = _openNetworkSenders.Count >= MaxConnections;
+
+					if (tooManyConnections && MaxConnections > 0)
+					{
+						switch (OnConnectionOverflow)
+						{
+							case NetworkTargetConnectionsOverflowAction.DiscardMessage:
+								InternalLogger.Warn("NetworkTarget(Name={0}): Discarding message otherwise to many connections.", Name);
+								logEvent.Continuation(null);
+								return;
+
+							case NetworkTargetConnectionsOverflowAction.AllowNewConnnection:
+								InternalLogger.Debug("NetworkTarget(Name={0}): Too may connections, but this is allowed", Name);
+								break;
+
+							case NetworkTargetConnectionsOverflowAction.Block:
+								while (_openNetworkSenders.Count >= MaxConnections)
+								{
+									InternalLogger.Debug("NetworkTarget(Name={0}): Blocking networktarget otherwhise too many connections.", Name);
+									Monitor.Wait(_openNetworkSenders);
+									InternalLogger.Trace("NetworkTarget(Name={0}): Entered critical section.", Name);
+								}
+
+								InternalLogger.Trace("NetworkTarget(Name={0}): Limit ok.", Name);
+								break;
+						}
+					}
+
+					try
+					{
+						sender = CreateNetworkSender(address);
+					}
+					catch (Exception ex)
+					{
+						InternalLogger.Error(ex, "NetworkTarget(Name={0}): Failed to create sender to address: '{1}'", Name, address);
+						throw;
+					}
+
+					linkedListNode = _openNetworkSenders.AddLast(sender);
+				}
+
+				ChunkedSend(
+					sender,
+					bytes,
+					ex =>
+					{
+						lock (_openNetworkSenders)
+						{
+							TryRemove(_openNetworkSenders, linkedListNode);
+
+							if (OnConnectionOverflow == NetworkTargetConnectionsOverflowAction.Block)
+								Monitor.PulseAll(_openNetworkSenders);
+						}
+
+						if (ex != null)
+							InternalLogger.Error(ex, "NetworkTarget(Name={0}): Error when sending.", Name);
+
+						sender.Close(ex2 => { });
+						logEvent.Continuation(ex);
+					});
+			}
 		}
 	}
 }
