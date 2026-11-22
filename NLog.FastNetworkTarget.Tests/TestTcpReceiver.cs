@@ -12,6 +12,7 @@ namespace NLog.FastNetworkTarget
 	{
 		private readonly TcpListener _listener;
 		private readonly Thread _acceptThread;
+		private readonly IPAddress _listenAddress;
 		private volatile bool _running;
 		private Socket _clientSocket;
 
@@ -21,16 +22,24 @@ namespace NLog.FastNetworkTarget
 		private readonly bool _storeLines;
 
 		public int Port => ((IPEndPoint)_listener.LocalEndpoint).Port;
-		public string Address => $"tcp4://127.0.0.1:{Port}";
+
+		public string Address => _listenAddress.AddressFamily == AddressFamily.InterNetworkV6
+			? $"tcp6://[{_listenAddress}]:{Port}"
+			: $"tcp4://{_listenAddress}:{Port}";
+
+		public string UnspecifiedTcpAddress => _listenAddress.AddressFamily == AddressFamily.InterNetworkV6
+			? $"tcp://[{_listenAddress}]:{Port}"
+			: $"tcp://{_listenAddress}:{Port}";
 
 		public long TotalBytesReceived => Interlocked.Read(ref _totalBytesReceived);
 		public long TotalLinesReceived => Interlocked.Read(ref _totalLinesReceived);
 		public ConcurrentQueue<string> ReceivedLines => _receivedLines;
 
-		public TestTcpReceiver(bool storeLines = false)
+		public TestTcpReceiver(bool storeLines = false, IPAddress listenAddress = null)
 		{
 			_storeLines = storeLines;
-			_listener = new TcpListener(IPAddress.Loopback, 0);
+			_listenAddress = listenAddress ?? IPAddress.Loopback;
+			_listener = new TcpListener(_listenAddress, 0);
 			_listener.Server.NoDelay = true;
 			_listener.Start();
 
@@ -75,7 +84,7 @@ namespace NLog.FastNetworkTarget
 		private void ReceiveLoop(Socket socket)
 		{
 			var buffer = new byte[64 * 1024];
-			var lineBuilder = _storeLines ? new StringBuilder() : null;
+			var lineBytes = _storeLines ? new MemoryStream(1024) : null;
 
 			try
 			{
@@ -96,13 +105,18 @@ namespace NLog.FastNetworkTarget
 							lines++;
 							if (_storeLines)
 							{
-								_receivedLines.Enqueue(lineBuilder.ToString().TrimEnd('\r'));
-								lineBuilder.Clear();
+								int len = (int)lineBytes.Length;
+								if (len > 0 && lineBytes.GetBuffer()[len - 1] == (byte)'\r')
+									len--;
+
+								var decoded = Encoding.UTF8.GetString(lineBytes.GetBuffer(), 0, len);
+								_receivedLines.Enqueue(decoded);
+								lineBytes.SetLength(0);
 							}
 						}
 						else if (_storeLines)
 						{
-							lineBuilder.Append((char)b);
+							lineBytes.WriteByte(b);
 						}
 					}
 
@@ -116,6 +130,7 @@ namespace NLog.FastNetworkTarget
 			}
 			finally
 			{
+				lineBytes?.Dispose();
 				try { socket.Close(); } catch { }
 				try { socket.Dispose(); } catch { }
 			}

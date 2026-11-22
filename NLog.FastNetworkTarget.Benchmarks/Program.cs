@@ -40,7 +40,7 @@ namespace NLog.FastNetworkTarget.Benchmarks
 
 	public static class Program
 	{
-		private const int WARMUP_COUNT = 5_000;
+		private const int WARMUP_COUNT = 50_000;
 
 		public static int Main(string[] args)
 		{
@@ -181,11 +181,11 @@ namespace NLog.FastNetworkTarget.Benchmarks
 			return layout;
 		}
 
-		private static TargetContext CreateTarget(string address, Layout layout = null)
+		private static TargetContext CreateTarget(MockTcpReceiver receiver, Layout layout = null)
 		{
 			var target = new NLog.Targets.FastNetworkTarget("LogStashInner")
 			{
-				Address = address,
+				Address = receiver.Address,
 				NewLine = true,
 				LineEnding = LineEndingMode.LF,
 				MaxQueueSize = 126976,
@@ -196,6 +196,13 @@ namespace NLog.FastNetworkTarget.Benchmarks
 			config.AddTarget("LogStashInner", target);
 			config.LoggingRules.Add(new LoggingRule("*", LogLevel.Trace, target));
 			var factory = new LogFactory(config);
+
+			// Prime lazy TCP connection before timed measurement
+			var primeMre = new ManualResetEvent(false);
+			target.WriteAsyncLogEvent(new AsyncLogEventInfo(new LogEventInfo(LogLevel.Info, "warmup", "prime"), ex => primeMre.Set()));
+			primeMre.WaitOne(3000);
+			receiver.WaitForMessages(1, TimeSpan.FromSeconds(3));
+			receiver.Reset();
 
 			return new TargetContext { Target = target, Factory = factory };
 		}
@@ -211,7 +218,7 @@ namespace NLog.FastNetworkTarget.Benchmarks
 
 		private static BenchmarkResult RunDirect(MockTcpReceiver receiver, int threads, int totalMessages)
 		{
-			using (var ctx = CreateTarget(receiver.Address))
+			using (var ctx = CreateTarget(receiver))
 			{
 				var target = ctx.Target;
 				var messagesPerThread = totalMessages / threads;
@@ -286,7 +293,7 @@ namespace NLog.FastNetworkTarget.Benchmarks
 
 		private static BenchmarkResult RunBatchDirect(MockTcpReceiver receiver, int totalMessages, int batchSize)
 		{
-			using (var ctx = CreateTarget(receiver.Address))
+			using (var ctx = CreateTarget(receiver))
 			{
 				var target = ctx.Target;
 				int batchCount = totalMessages / batchSize;
@@ -374,6 +381,12 @@ namespace NLog.FastNetworkTarget.Benchmarks
 
 			GlobalDiagnosticsContext.Set("RunningTime", "0042.0s");
 
+			// Prime lazy TCP connection before timed measurement
+			logger.Info("Warmup connection prime");
+			logFactory.Flush(TimeSpan.FromSeconds(5));
+			receiver.WaitForMessages(1, TimeSpan.FromSeconds(3));
+			receiver.Reset();
+
 			var messagesPerThread = totalMessages / threads;
 			var barrier = new Barrier(threads + 1);
 			var process = Process.GetCurrentProcess();
@@ -437,7 +450,7 @@ namespace NLog.FastNetworkTarget.Benchmarks
 
 		private static BenchmarkResult RunLargePayload(MockTcpReceiver receiver, int totalMessages, int payloadSizeKb)
 		{
-			using (var ctx = CreateTarget(receiver.Address, new SimpleLayout("${message}")))
+			using (var ctx = CreateTarget(receiver, new SimpleLayout("${message}")))
 			{
 				var target = ctx.Target;
 				var largeString = new string('X', payloadSizeKb * 1024 - 1);
@@ -480,11 +493,34 @@ namespace NLog.FastNetworkTarget.Benchmarks
 			}
 		}
 
+#if !NET8_0_OR_GREATER
+		private static readonly bool _appDomainMonitoringSupported = TryEnableAppDomainMonitoring();
+
+		private static bool TryEnableAppDomainMonitoring()
+		{
+			try
+			{
+				AppDomain.MonitoringIsEnabled = true;
+				return AppDomain.MonitoringIsEnabled;
+			}
+			catch
+			{
+				return false;
+			}
+		}
+#endif
+
 		private static long GetAllocatedBytes()
 		{
 #if NET8_0_OR_GREATER
 			return GC.GetTotalAllocatedBytes(precise: true);
 #else
+			if (_appDomainMonitoringSupported)
+			{
+				long total = AppDomain.CurrentDomain.MonitoringTotalAllocatedMemorySize;
+				if (total > 0)
+					return total;
+			}
 			return GC.GetTotalMemory(forceFullCollection: false);
 #endif
 		}

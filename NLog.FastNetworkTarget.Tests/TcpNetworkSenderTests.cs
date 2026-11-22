@@ -83,9 +83,16 @@ namespace NLog.FastNetworkTarget
 
 			public int Send(byte[] buffer, int offset, int size, SocketFlags socketFlags)
 			{
+				_sender.SendStartedSignal?.Set();
+				_sender.SendGate?.WaitOne(5000);
+
+				int effectiveSize = _sender.MaxSendChunkSize > 0
+					? Math.Min(size, _sender.MaxSendChunkSize)
+					: size;
+
 				lock (this)
 				{
-					_log.WriteLine("Send sync {0} {1} '{2}'", offset, size, Encoding.UTF8.GetString(buffer, offset, size));
+					_log.WriteLine("Send sync {0} {1} '{2}'", offset, effectiveSize, Encoding.UTF8.GetString(buffer, offset, effectiveSize));
 
 					if (_sender.SendFailureIn > 0)
 					{
@@ -105,7 +112,7 @@ namespace NLog.FastNetworkTarget
 						throw new SocketException((int)SocketError.NotConnected);
 				}
 
-				return size;
+				return effectiveSize;
 			}
 
 			public void Dispose()
@@ -142,6 +149,9 @@ namespace NLog.FastNetworkTarget
 
 			public int SendFailureIn { get; set; }
 			public int ConnectFailure { get; set; }
+			public int MaxSendChunkSize { get; set; }
+			public ManualResetEvent SendGate { get; set; }
+			public ManualResetEvent SendStartedSignal { get; set; }
 			public StringWriter Log { get; set; }
 
 			#endregion
@@ -350,6 +360,158 @@ namespace NLog.FastNetworkTarget
 				else
 					Assert.That(exceptions[i], Is.Not.Null);
 			}
+
+			sender.Close(ex => { });
+		}
+
+		[Test]
+		public void TcpPartialSend_InvokesContinuationOnceOnly()
+		{
+			var sender = new MyTcpNetworkSender("tcp+thread://hostname:123", AddressFamily.Unspecified)
+			{
+				MaxSendChunkSize = 3
+			};
+			sender.Initialize();
+
+			var buffer = Encoding.UTF8.GetBytes("0123456789ABCDEF"); // 16 bytes -> 6 Send() calls (3+3+3+3+3+1)
+			int continuationCount = 0;
+			Exception capturedEx = null;
+			var done = new ManualResetEvent(false);
+
+			sender.Send(buffer, 0, buffer.Length, ex =>
+			{
+				capturedEx = ex;
+				Interlocked.Increment(ref continuationCount);
+				done.Set();
+			});
+
+			Assert.That(done.WaitOne(3000), Is.True);
+			Thread.Sleep(50);
+
+			Assert.That(capturedEx, Is.Null);
+			Assert.That(continuationCount, Is.EqualTo(1), "Continuation must be invoked exactly once after full transmission");
+			Assert.That(sender.SentMessages, Is.EqualTo(1));
+			Assert.That(sender.SentBytes, Is.EqualTo(16));
+
+			sender.Close(ex => { });
+		}
+
+		[Test]
+		public void TcpQueueOverflow_Discard_DirectlyIncrementsDroppedMessages()
+		{
+			using (var sendGate = new ManualResetEvent(false))
+			using (var sendStarted = new ManualResetEvent(false))
+			{
+				var sender = new MyTcpNetworkSender("tcp+thread://hostname:123", AddressFamily.Unspecified)
+				{
+					MaxQueueSize = 16,
+					OnQueueOverflow = NLog.Targets.NetworkTargetQueueOverflowAction.Discard,
+					SendGate = sendGate,
+					SendStartedSignal = sendStarted
+				};
+				sender.Initialize();
+
+				var payload = Encoding.UTF8.GetBytes("overflow-test");
+
+				// First message enters Send() and blocks on sendGate
+				sender.Send(payload, 0, payload.Length, ex => { });
+				Assert.That(sendStarted.WaitOne(3000), Is.True);
+
+				// Enqueue 40 more items into 16-slot ring -> deterministic overflow discards
+				int completedContinuations = 0;
+				for (int i = 0; i < 40; i++)
+				{
+					sender.Send(payload, 0, payload.Length, ex => Interlocked.Increment(ref completedContinuations));
+				}
+
+				Assert.That(sender.DroppedMessages, Is.GreaterThanOrEqualTo(24));
+				Assert.That(sender.SendFailures, Is.EqualTo(0));
+
+				sendGate.Set();
+				var flushed = new ManualResetEvent(false);
+				sender.FlushAsync(ex => flushed.Set());
+				Assert.That(flushed.WaitOne(3000), Is.True);
+
+				sender.Close(ex => { });
+			}
+		}
+
+		[Test]
+		public void TcpQueueOverflow_Block_IncrementsBlockedEnqueuesAndDeliversAll()
+		{
+			using (var sendGate = new ManualResetEvent(false))
+			using (var sendStarted = new ManualResetEvent(false))
+			{
+				var sender = new MyTcpNetworkSender("tcp+thread://hostname:123", AddressFamily.Unspecified)
+				{
+					MaxQueueSize = 16,
+					OnQueueOverflow = NLog.Targets.NetworkTargetQueueOverflowAction.Block,
+					SendGate = sendGate,
+					SendStartedSignal = sendStarted
+				};
+				sender.Initialize();
+
+				var payload = Encoding.UTF8.GetBytes("block-test");
+
+				// First item enters Send() and holds consumer
+				sender.Send(payload, 0, payload.Length, ex => { });
+				Assert.That(sendStarted.WaitOne(3000), Is.True);
+
+				int totalToEnqueue = 24;
+				var producerDone = new ManualResetEvent(false);
+				var producer = new Thread(() =>
+				{
+					for (int i = 0; i < totalToEnqueue; i++)
+						sender.Send(payload, 0, payload.Length, ex => { });
+					producerDone.Set();
+				})
+				{
+					IsBackground = true
+				};
+				producer.Start();
+
+				// Wait until producer blocks on full ring
+				var sw = System.Diagnostics.Stopwatch.StartNew();
+				while (sender.BlockedEnqueues == 0 && sw.ElapsedMilliseconds < 2000)
+					Thread.Sleep(5);
+
+				Assert.That(sender.BlockedEnqueues, Is.GreaterThan(0));
+
+				// Release gate so all items drain
+				sendGate.Set();
+				Assert.That(producerDone.WaitOne(3000), Is.True);
+
+				var flushed = new ManualResetEvent(false);
+				sender.FlushAsync(ex => flushed.Set());
+				Assert.That(flushed.WaitOne(3000), Is.True);
+
+				Assert.That(sender.DroppedMessages, Is.EqualTo(0));
+				Assert.That(sender.SentMessages, Is.EqualTo(1 + totalToEnqueue));
+
+				sender.Close(ex => { });
+			}
+		}
+
+		[Test]
+		public void TcpSendAfterClose_InvokesContinuationWithError()
+		{
+			var sender = new MyTcpNetworkSender("tcp+thread://hostname:123", AddressFamily.Unspecified);
+			sender.Initialize();
+
+			var closed = new ManualResetEvent(false);
+			sender.Close(ex => closed.Set());
+			Assert.That(closed.WaitOne(3000), Is.True);
+
+			Exception afterCloseEx = null;
+			var contCalled = new ManualResetEvent(false);
+			sender.Send(new byte[] { 1, 2, 3 }, 0, 3, ex =>
+			{
+				afterCloseEx = ex;
+				contCalled.Set();
+			});
+
+			Assert.That(contCalled.WaitOne(1000), Is.True);
+			Assert.That(afterCloseEx, Is.Not.Null);
 		}
 	}
 }

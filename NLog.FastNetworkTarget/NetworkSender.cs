@@ -35,6 +35,7 @@ using System;
 using System.IO;
 using System.Net;
 using System.Threading;
+using System.Diagnostics;
 using System.Net.Sockets;
 
 using NLog.Common;
@@ -48,7 +49,7 @@ namespace NLog.Internal.NetworkSenders
 	{
 		#region Fields & Properties
 
-		private static int currentSendTime;
+		private long _lastSendTicks;
 
 		/// <summary>
 		/// Gets the address of the network endpoint.
@@ -56,9 +57,9 @@ namespace NLog.Internal.NetworkSenders
 		public string Address { get; private set; }
 
 		/// <summary>
-		/// Gets the last send time.
+		/// Gets the monotonic timestamp ticks of the last send operation.
 		/// </summary>
-		public int LastSendTime { get; private set; }
+		public long LastSendTicks => Volatile.Read(ref _lastSendTicks);
 
 		#endregion
 
@@ -71,10 +72,15 @@ namespace NLog.Internal.NetworkSenders
 		protected NetworkSender(string url)
 		{
 			Address = url;
-			LastSendTime = Interlocked.Increment(ref currentSendTime);
+			_lastSendTicks = Stopwatch.GetTimestamp();
 		}
 
 		#endregion
+
+		internal void TouchLastSendTime()
+		{
+			Volatile.Write(ref _lastSendTicks, Stopwatch.GetTimestamp());
+		}
 
 		/// <summary>
 		/// Initializes this network sender.
@@ -104,13 +110,13 @@ namespace NLog.Internal.NetworkSenders
 		{
 			try
 			{
-				LastSendTime = Interlocked.Increment(ref currentSendTime);
+				TouchLastSendTime();
 				DoSend(bytes, offset, length, asyncContinuation);
 			}
 			catch (Exception ex)
 			{
 				InternalLogger.Error(ex, "NetworkTarget: Error sending network request");
-				asyncContinuation(ex);
+				asyncContinuation?.Invoke(ex);
 			}
 		}
 
@@ -160,7 +166,13 @@ namespace NLog.Internal.NetworkSenders
 			{
 				case UriHostNameType.IPv4:
 				case UriHostNameType.IPv6:
-					return new IPEndPoint(IPAddress.Parse(uri.Host), uri.Port);
+					{
+						var ip = IPAddress.Parse(uri.Host);
+						if (addressFamily != AddressFamily.Unspecified && ip.AddressFamily != addressFamily)
+							throw new IOException($"Cannot resolve '{uri.Host}' to an address in '{addressFamily}'");
+
+						return new IPEndPoint(ip, uri.Port);
+					}
 
 				default:
 					{

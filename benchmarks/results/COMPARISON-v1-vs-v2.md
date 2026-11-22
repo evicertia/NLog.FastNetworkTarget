@@ -11,13 +11,13 @@ Testing conducted on macOS Darwin (Apple Silicon, 12 logical cores) with:
 
 | Scenario | v1 Throughput | v2 Throughput | Throughput Gain | v1 CPU (ms/100k) | v2 CPU (ms/100k) | CPU Reduction | Allocations (v1 -> v2) |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `SingleThread_Direct` | 110,279 msg/s | **158,219 msg/s** | **+43.5%** | 5,024.8 | **3,223.4** | **-35.8%** | 2,302 -> 1,459 B/msg (-37%) |
-| `Concurrent8_Direct` | 229,111 msg/s | **436,876 msg/s** | **+90.7% (1.9x)** | 1,700.1 | **854.3** | **-49.7%** | 2,251 -> 1,600 B/msg (-29%) |
-| `Concurrent16_Direct` | 240,485 msg/s | **371,890 msg/s** | **+54.6% (1.5x)** | 1,898.8 | **1,181.4** | **-37.8%** | 2,254 -> 1,972 B/msg (-13%) |
-| `Concurrent32_Direct` | 236,488 msg/s | **334,501 msg/s** | **+41.4% (1.4x)** | 1,988.1 | **1,372.7** | **-30.9%** | 2,261 -> 2,147 B/msg (-5%) |
-| `Batch1000_Direct` | 262,881 msg/s | **373,603 msg/s** | **+42.1%** | 970.5 | **456.8** | **-52.9%** | 1,540 -> 747 B/msg (-51%) |
-| `HermaE2E_FullPipeline` | 4,948 msg/s *(queue overflow drops)* | **671,351 msg/s** *(0 drops)* | **+13,468% (135x)** | 841.4 | **697.1** | **-17.1%** | 1,743 -> 1,589 B/msg |
-| `LargePayload_32KB` | 43,835 msg/s | **58,464 msg/s** | **+33.4%** | 5,179.8 | **5,132.3** | **-1.0%** | 98,968 -> 27,505 B/msg (-72%) |
+| `SingleThread_Direct` | 110,279 msg/s | **389,412 msg/s** | **+253.1% (3.5x)** | 5,024.8 | **1,457.1** | **-71.0%** | 2,302 -> 1,456 B/msg (-37%) |
+| `Concurrent8_Direct` | 229,111 msg/s | **421,012 msg/s** | **+83.8% (1.8x)** | 1,700.1 | **931.4** | **-45.2%** | 2,251 -> 1,666 B/msg (-26%) |
+| `Concurrent16_Direct` | 240,485 msg/s | **303,646 msg/s** | **+26.3% (1.3x)** | 1,898.8 | **1,323.3** | **-30.3%** | 2,254 -> 2,086 B/msg (-7%) |
+| `Concurrent32_Direct` | 236,488 msg/s | **373,278 msg/s** | **+57.8% (1.6x)** | 1,988.1 | **1,391.7** | **-30.0%** | 2,261 -> 2,112 B/msg (-7%) |
+| `Batch1000_Direct` | 262,881 msg/s | **375,705 msg/s** | **+42.9% (1.4x)** | 970.5 | **460.0** | **-52.6%** | 1,540 -> 758 B/msg (-51%) |
+| `HermaE2E_FullPipeline` | 4,948 msg/s *(queue overflow drops)* | **549,868 msg/s** *(0 drops, 0 Gen2)* | **+11,013% (111x)** | 841.4 | **698.1** | **-17.0%** | 1,743 -> 1,555 B/msg (-11%) |
+| `LargePayload_32KB` | 43,835 msg/s | **62,506 msg/s** *(1.95 GB/s)* | **+42.6% (1.4x)** | 5,179.8 | **3,693.7** | **-28.7%** | 98,968 -> 19,318 B/msg (-80%) |
 
 ---
 
@@ -25,28 +25,28 @@ Testing conducted on macOS Darwin (Apple Silicon, 12 logical cores) with:
 
 | Scenario | v1 Throughput | v2 Throughput | Throughput Gain | v1 CPU (ms/100k) | v2 CPU (ms/100k) | CPU Reduction | Gen2 GC Impact |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| `SingleThread_Direct` | 66,914 msg/s | **75,946 msg/s** | **+13.5%** | 3,003.4 | **2,776.4** | **-7.6%** | 2 -> 3 |
-| `Concurrent8_Direct` | 61,994 msg/s | **359,815 msg/s** | **+480.4% (5.8x)** | 3,781.5 | **2,189.4** | **-42.1%** | 4 -> 5 |
-| `Concurrent16_Direct` | 62,023 msg/s | **390,127 msg/s** | **+529.0% (6.3x)** | 3,818.0 | **2,408.5** | **-36.9%** | 4 -> 5 |
-| `Concurrent32_Direct` | 60,745 msg/s | **385,526 msg/s** | **+534.7% (6.3x)** | 4,285.3 | **2,560.5** | **-40.2%** | 4 -> 6 |
-| `Batch1000_Direct` | 66,278 msg/s | **103,306 msg/s** | **+55.9%** | 2,839.8 | **1,045.8** | **-63.2%** | 1 -> 1 |
-| `HermaE2E_FullPipeline` | 4,900 msg/s *(queue overflow drops)* | **350,331 msg/s** *(0 drops)* | **+7,049% (71x)** | 2,464.1 | **2,224.9** | **-9.7%** | 6 -> 1 (-83%) |
-| `LargePayload_32KB` | 17,522 msg/s | **29,602 msg/s** | **+68.9%** | 10,190.7 | **6,001.1** | **-41.1%** | 14 -> 2 (-86%) |
+| `SingleThread_Direct` | 66,914 msg/s | **81,908 msg/s** | **+22.4%** | 3,003.4 | **2,554.2** | **-15.0%** | 2 -> 2 |
+| `Concurrent8_Direct` | 61,994 msg/s | **416,052 msg/s** | **+571.1% (6.7x)** | 3,781.5 | **1,966.0** | **-48.0%** | 4 -> 4 |
+| `Concurrent16_Direct` | 62,023 msg/s | **468,586 msg/s** | **+655.5% (7.6x)** | 3,818.0 | **1,949.6** | **-48.9%** | 4 -> 5 |
+| `Concurrent32_Direct` | 60,745 msg/s | **466,534 msg/s** | **+668.0% (7.7x)** | 4,285.3 | **2,179.6** | **-49.1%** | 4 -> 5 |
+| `Batch1000_Direct` | 66,278 msg/s | **116,393 msg/s** | **+75.6% (1.8x)** | 2,839.8 | **940.9** | **-66.9%** | 1 -> 1 |
+| `HermaE2E_FullPipeline` | 4,900 msg/s *(queue overflow drops)* | **377,472 msg/s** *(0 drops)* | **+7,604% (77x)** | 2,464.1 | **2,031.7** | **-17.5%** | 6 -> 1 (-83%) |
+| `LargePayload_32KB` | 17,522 msg/s | **30,090 msg/s** | **+71.7% (1.7x)** | 10,190.7 | **6,132.4** | **-39.8%** | 14 -> 1 (-93%) |
 
 ---
 
 ## 3. Summary of Key Wins
 
 1. **Massive Concurrency Scalability**:
-   - Under Mono, 32-thread concurrent throughput increased from **60,745 msg/s to 385,526 msg/s (6.3x faster)**, eliminating the previous severe lock contention.
-   - Under .NET 8, concurrent throughput reached **436,876 msg/s (190 MB/s network throughput)**.
+   - Under Mono, 16–32 thread concurrent throughput jumped from **~61k msg/s to 467k–469k msg/s (7.6x–7.7x faster, >203 MB/s)** with **49% less CPU**, completely eliminating NLog `SyncRoot` and `BlockingCollection` semaphore lock contention.
+   - Under .NET 8, single-thread throughput jumped **3.5x** (`389k msg/s`) with **71% less CPU**, and 8–32 thread concurrent throughput reached **373k–421k msg/s**.
 
 2. **End-to-End Pipeline Absorption (Herma config)**:
-   - Full Herma pipeline (`Logger -> AsyncTargetWrapper -> FilteringWrapper -> FastNetworkTarget -> JsonLayout`) increased from **4.9k msg/s to 671k msg/s on .NET 8 (135x faster)** and **350k msg/s on Mono (71x faster)** with **zero dropped messages**.
+   - Full Herma pipeline (`Logger -> AsyncTargetWrapper -> FilteringWrapper -> FastNetworkTarget -> JsonLayout`) increased from **~4.9k msg/s to 550k msg/s on .NET 8 (111x faster, 0 Gen2 GCs)** and **377k msg/s on Mono (77x faster)** with **zero dropped messages**.
 
 3. **CPU Efficiency**:
-   - CPU time per 100,000 messages dropped by **35% to 53% on .NET 8**, and by **37% to 63% on Mono**.
+   - CPU time per 100,000 messages dropped by **29% to 71% on .NET 8**, and by **40% to 67% on Mono**.
 
 4. **Memory Allocations & LOH (Large Object Heap)**:
-   - Steady-state byte allocations cut by **30% to 51%**.
-   - Large payload allocations cut by **72%** (from 98 KB/msg to 27 KB/msg), reducing Gen2 GC collections on Mono from **14 down to 2** (86% reduction in pause-inducing full GCs).
+   - Batch allocations cut by **51%** (`1,540 -> 758 B/msg`).
+   - 32 KB large payload allocations cut by **80%** (`98,968 -> 19,318 B/msg` on .NET 8 at `1.95 GB/s`), reducing Gen2 GC collections on Mono from **14 down to 1** (**93% reduction** in pause-inducing full GCs).
