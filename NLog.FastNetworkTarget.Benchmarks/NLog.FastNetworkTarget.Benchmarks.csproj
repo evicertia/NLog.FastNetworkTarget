@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<TargetFrameworks>net8.0;net462</TargetFrameworks>
+		<LangVersion>latest</LangVersion>
+		<Company>Evicertia S.L.</Company>
+		<RootNamespace>NLog.FastNetworkTarget.Benchmarks</RootNamespace>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<ProjectReference Include="..\NLog.FastNetworkTarget\NLog.FastNetworkTarget.csproj" />
+		<PackageReference Include="NLog" Version="4.7.11" />
+		<PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="All" />
+	</ItemGroup>
+</Project>

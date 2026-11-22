@@ -152,6 +152,7 @@ namespace NLog.FastNetworkTarget
 				: base(url, addressFamily)
 			{
 				MaxQueueSize = 100;
+				BatchSize = 1;
 				Log = new StringWriter();
 				ConnectionTimeout = TimeSpan.FromSeconds(1);
 			}

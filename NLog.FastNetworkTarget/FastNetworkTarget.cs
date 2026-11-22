@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Net.Sockets;
 using System.ComponentModel;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.Security.Authentication;
 
 using NLog.Common;
@@ -17,27 +18,74 @@ namespace NLog.Targets
 	[Target("FastNetwork")]
 	public class FastNetworkTarget : TargetWithLayout
 	{
+		#region Delegates for Internal NLog Methods
+
+		private delegate bool TryGetCachedLayoutValueDelegate(LogEventInfo logEvent, Layout layout, out object text);
+		private delegate void RenderAppendBuilderDelegate(Layout layout, LogEventInfo logEvent, StringBuilder target, bool cacheLayoutResult);
+
+		private static readonly TryGetCachedLayoutValueDelegate _tryGetCachedLayoutValueFn;
+		private static readonly RenderAppendBuilderDelegate _renderAppendBuilderFn;
+		private static readonly MethodInfo _tryGetCachedLayoutValueMethod;
+		private static readonly MethodInfo _renderAppendBuilderMethod;
+		private static readonly AsyncContinuation _completedContinuation;
+
+		static FastNetworkTarget()
+		{
+			try
+			{
+				_tryGetCachedLayoutValueMethod = typeof(LogEventInfo).GetMethod("TryGetCachedLayoutValue", BindingFlags.NonPublic | BindingFlags.Instance);
+				if (_tryGetCachedLayoutValueMethod != null)
+					_tryGetCachedLayoutValueFn = (TryGetCachedLayoutValueDelegate)Delegate.CreateDelegate(typeof(TryGetCachedLayoutValueDelegate), _tryGetCachedLayoutValueMethod);
+			}
+			catch (Exception ex)
+			{
+				InternalLogger.Warn(ex, "FastNetworkTarget: Could not bind TryGetCachedLayoutValue delegate.");
+			}
+
+			try
+			{
+				_renderAppendBuilderMethod = typeof(Layout).GetMethod("RenderAppendBuilder", BindingFlags.NonPublic | BindingFlags.Instance);
+				if (_renderAppendBuilderMethod != null)
+					_renderAppendBuilderFn = (RenderAppendBuilderDelegate)Delegate.CreateDelegate(typeof(RenderAppendBuilderDelegate), _renderAppendBuilderMethod);
+			}
+			catch (Exception ex)
+			{
+				InternalLogger.Warn(ex, "FastNetworkTarget: Could not bind RenderAppendBuilder delegate.");
+			}
+
+			try
+			{
+				var singleCallType = typeof(AsyncHelpers).Assembly.GetType("NLog.Internal.SingleCallContinuation");
+				var completedField = singleCallType?.GetField("Completed", BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Public);
+				_completedContinuation = completedField?.GetValue(null) as AsyncContinuation;
+			}
+			catch
+			{
+				// Ignore
+			}
+		}
+
+		#endregion
+
 		#region Fields & Properties
 
-		private static readonly MethodInfo _tryGetCachedLayoutValue = typeof(LogEventInfo).GetMethod("TryGetCachedLayoutValue", BindingFlags.NonPublic | BindingFlags.Instance);
-		private static readonly MethodInfo _renderAppendBuilder = typeof(Layout).GetMethod("RenderAppendBuilder", BindingFlags.NonPublic | BindingFlags.Instance);
-
+		// Retained for backward compatibility with Herma.Facilities NLogStatsFetcher reflection
 		private readonly IDictionary<string, LinkedListNode<NetworkSender>> _currentSenderCache = new Dictionary<string, LinkedListNode<NetworkSender>>();
-		private readonly ReusableBufferCreator _reusableEncodingBuffer = new ReusableBufferCreator(16 * 1024);
 		private readonly LinkedList<NetworkSender> _openNetworkSenders = new LinkedList<NetworkSender>();
-		private readonly ReusableBuilderCreator _reusableLayoutBuilder = new ReusableBuilderCreator();
+
+		private readonly ConcurrentDictionary<string, TcpNetworkSender> _senderMap = new ConcurrentDictionary<string, TcpNetworkSender>(StringComparer.OrdinalIgnoreCase);
+		private TcpNetworkSender _fixedSender;
+		private byte[] _newLineBytes;
+
+		[ThreadStatic]
+		private static StringBuilder t_threadBuilder;
+
+		[ThreadStatic]
+		private static char[] t_threadCharBuffer;
 
 		/// <summary>
 		/// Gets or sets the network address.
 		/// </summary>
-		/// <remarks>
-		/// The network address can be:
-		/// <ul>
-		/// <li>tcp://host:port - TCP (auto select IPv4/IPv6)</li>
-		/// <li>tcp4://host:port - force TCP/IPv4</li>
-		/// <li>tcp6://host:port - force TCP/IPv6</li>
-		/// </ul>
-		/// </remarks>
 		public Layout Address { get; set; }
 
 		/// <summary>
@@ -76,7 +124,7 @@ namespace NLog.Targets
 		public int MaxConnections { get; set; }
 
 		/// <summary>
-		/// Gets or sets the action that should be taken if the will be more connections than <see cref="MaxConnections"/>.
+		/// Gets or sets the action that should be taken if there will be more connections than <see cref="MaxConnections"/>.
 		/// </summary>
 		public NetworkTargetConnectionsOverflowAction OnConnectionOverflow { get; set; }
 
@@ -99,12 +147,12 @@ namespace NLog.Targets
 		public Encoding Encoding { get; set; } = Encoding.UTF8;
 
 		/// <summary>
-		/// Get or set the SSL/TLS protocols. Not implemented.
+		/// Get or set the SSL/TLS protocols.
 		/// </summary>
 		public SslProtocols SslProtocols { get; set; } = SslProtocols.None;
 
 		/// <summary>
-		/// The number of milliseconds a connection will remain idle before the first keep-alive probe is sent
+		/// The number of milliseconds a connection will remain idle before the first keep-alive probe is sent.
 		/// </summary>
 		public int KeepAliveTime { get; set; }
 
@@ -113,6 +161,161 @@ namespace NLog.Targets
 		/// </summary>
 		[DefaultValue(1000)]
 		public int ConnectionTimeout { get; set; } = 1000;
+
+		/// <summary>
+		/// Gets or sets the action to take when the internal sender queue is full.
+		/// Defaults to <see cref="NetworkTargetQueueOverflowAction.Discard"/> to avoid blocking producer threads.
+		/// </summary>
+		[DefaultValue(NetworkTargetQueueOverflowAction.Discard)]
+		public NetworkTargetQueueOverflowAction OnQueueOverflow { get; set; } = NetworkTargetQueueOverflowAction.Discard;
+
+		/// <summary>
+		/// Gets or sets the maximum number of items to coalesce per socket write.
+		/// </summary>
+		[DefaultValue(512)]
+		public int BatchSize { get; set; } = 512;
+
+		/// <summary>
+		/// Gets or sets the maximum coalesced batch size in bytes.
+		/// </summary>
+		[DefaultValue(256 * 1024)]
+		public int MaxBatchBytes { get; set; } = 256 * 1024;
+
+		/// <summary>
+		/// Gets or sets whether TCP_NODELAY is enabled.
+		/// </summary>
+		[DefaultValue(true)]
+		public bool NoDelay { get; set; } = true;
+
+		/// <summary>
+		/// Gets or sets the socket send timeout in milliseconds.
+		/// </summary>
+		[DefaultValue(30000)]
+		public int SendTimeout { get; set; } = 30000;
+
+		/// <summary>
+		/// Gets or sets the socket send buffer size in bytes.
+		/// </summary>
+		[DefaultValue(256 * 1024)]
+		public int SendBufferSize { get; set; } = 256 * 1024;
+
+		#endregion
+
+		#region Observability Metrics
+
+		public long PendingMessages
+		{
+			get
+			{
+				if (_fixedSender != null)
+					return _fixedSender.PendingMessages;
+
+				long total = 0;
+				foreach (var pair in _senderMap)
+					total += pair.Value.PendingMessages;
+				return total;
+			}
+		}
+
+		public int ConnectionCount => _fixedSender != null ? 1 : _senderMap.Count;
+
+		public long SentMessages
+		{
+			get
+			{
+				if (_fixedSender != null)
+					return _fixedSender.SentMessages;
+
+				long total = 0;
+				foreach (var pair in _senderMap)
+					total += pair.Value.SentMessages;
+				return total;
+			}
+		}
+
+		public long SentBytes
+		{
+			get
+			{
+				if (_fixedSender != null)
+					return _fixedSender.SentBytes;
+
+				long total = 0;
+				foreach (var pair in _senderMap)
+					total += pair.Value.SentBytes;
+				return total;
+			}
+		}
+
+		public long SentBatches
+		{
+			get
+			{
+				if (_fixedSender != null)
+					return _fixedSender.SentBatches;
+
+				long total = 0;
+				foreach (var pair in _senderMap)
+					total += pair.Value.SentBatches;
+				return total;
+			}
+		}
+
+		public long DroppedMessages
+		{
+			get
+			{
+				if (_fixedSender != null)
+					return _fixedSender.DroppedMessages;
+
+				long total = 0;
+				foreach (var pair in _senderMap)
+					total += pair.Value.DroppedMessages;
+				return total;
+			}
+		}
+
+		public long BlockedEnqueues
+		{
+			get
+			{
+				if (_fixedSender != null)
+					return _fixedSender.BlockedEnqueues;
+
+				long total = 0;
+				foreach (var pair in _senderMap)
+					total += pair.Value.BlockedEnqueues;
+				return total;
+			}
+		}
+
+		public long SendFailures
+		{
+			get
+			{
+				if (_fixedSender != null)
+					return _fixedSender.SendFailures;
+
+				long total = 0;
+				foreach (var pair in _senderMap)
+					total += pair.Value.SendFailures;
+				return total;
+			}
+		}
+
+		public long ReconnectCount
+		{
+			get
+			{
+				if (_fixedSender != null)
+					return _fixedSender.ReconnectCount;
+
+				long total = 0;
+				foreach (var pair in _senderMap)
+					total += pair.Value.ReconnectCount;
+				return total;
+			}
+		}
 
 		#endregion
 
@@ -131,285 +334,22 @@ namespace NLog.Targets
 
 		#endregion
 
-		#region Private methods
+		#region Initialization & Teardown
 
-		private static bool TryGetCachedLayoutValue(LogEventInfo logEvent, Layout layout, out object text)
+		protected override void InitializeTarget()
 		{
-			var args = new[] { layout, (object)null };
-			var result = (bool)_tryGetCachedLayoutValue.Invoke(logEvent, args);
+			base.InitializeTarget();
 
-			text = args[1];
+			_newLineBytes = NewLine && LineEnding != null
+				? Encoding.GetBytes(LineEnding.NewLineCharacters)
+				: Array.Empty<byte>();
 
-			return result;
-		}
-
-		private static void RenderAppendBuilder(Layout layout, LogEventInfo logEvent, StringBuilder target, bool cacheLayoutResult = false)
-		{
-			_renderAppendBuilder.Invoke(layout, new object[] { logEvent, target, cacheLayoutResult });
-		}
-
-		private static bool TryRemove<T>(LinkedList<T> list, LinkedListNode<T> node)
-		{
-			if (node is null || list != node.List)
-				return false;
-
-			list.Remove(node);
-			return true;
-		}
-
-		private static NetworkSender Create(string url, int maxQueueSize, SslProtocols sslProtocols, TimeSpan keepAliveTime, TimeSpan connectionTimeout)
-		{
-			if (url.StartsWith("tcp://", StringComparison.OrdinalIgnoreCase))
+			// Fast-path: detect static/fixed addresses at initialization time
+			if (Address is SimpleLayout simple && simple.IsFixedText)
 			{
-				return new TcpNetworkSender(url, AddressFamily.Unspecified)
-				{
-					ConnectionTimeout = connectionTimeout,
-					KeepAliveTime = keepAliveTime,
-					SslProtocols = sslProtocols,
-					MaxQueueSize = maxQueueSize,
-				};
-			}
-
-			if (url.StartsWith("tcp4://", StringComparison.OrdinalIgnoreCase))
-			{
-				return new TcpNetworkSender(url, AddressFamily.InterNetwork)
-				{
-					ConnectionTimeout = connectionTimeout,
-					KeepAliveTime = keepAliveTime,
-					SslProtocols = sslProtocols,
-					MaxQueueSize = maxQueueSize,
-				};
-			}
-
-			if (url.StartsWith("tcp6://", StringComparison.OrdinalIgnoreCase))
-			{
-				return new TcpNetworkSender(url, AddressFamily.InterNetworkV6)
-				{
-					ConnectionTimeout = connectionTimeout,
-					KeepAliveTime = keepAliveTime,
-					SslProtocols = sslProtocols,
-					MaxQueueSize = maxQueueSize,
-				};
-			}
-
-			throw new ArgumentException("Unrecognized network address.", nameof(url));
-		}
-
-		private NetworkSender CreateNetworkSender(string address)
-		{
-			var sender = Create(address, MaxQueueSize, SslProtocols, TimeSpan.FromMilliseconds(KeepAliveTime), TimeSpan.FromMilliseconds(ConnectionTimeout));
-			sender.Initialize();
-
-			return sender;
-		}
-
-		private LinkedListNode<NetworkSender> GetCachedNetworkSender(string address)
-		{
-			lock (_currentSenderCache)
-			{
-				// Already have address
-				if (_currentSenderCache.TryGetValue(address, out var senderNode))
-					return senderNode;
-
-				if (_currentSenderCache.Count >= ConnectionCacheSize)
-				{
-					// Make room in the cache by closing the least recently used connection
-					LinkedListNode<NetworkSender> leastRecentlyUsed = null;
-					var minAccessTime = int.MaxValue;
-
-					foreach (var pair in _currentSenderCache)
-					{
-						var networkSender = pair.Value.Value;
-						if (networkSender.LastSendTime < minAccessTime)
-						{
-							minAccessTime = networkSender.LastSendTime;
-							leastRecentlyUsed = pair.Value;
-						}
-					}
-
-					if (leastRecentlyUsed != null)
-						ReleaseCachedConnection(leastRecentlyUsed);
-				}
-
-				var sender = CreateNetworkSender(address);
-				lock (_openNetworkSenders)
-					senderNode = _openNetworkSenders.AddLast(sender);
-
-				_currentSenderCache.Add(address, senderNode);
-
-				return senderNode;
-			}
-		}
-
-		private void ReleaseCachedConnection(LinkedListNode<NetworkSender> senderNode)
-		{
-			lock (_currentSenderCache)
-			{
-				var networkSender = senderNode.Value;
-				lock (_openNetworkSenders)
-				{
-					if (TryRemove(_openNetworkSenders, senderNode))
-					{
-						// Only remove it once.
-						networkSender.Close(ex => { });
-					}
-				}
-
-				// Make sure the current sender for this address is the one we want to remove.
-				if (_currentSenderCache.TryGetValue(networkSender.Address, out var sender2) && ReferenceEquals(senderNode, sender2))
-					_currentSenderCache.Remove(networkSender.Address);
-			}
-		}
-
-		private void ChunkedSend(NetworkSender sender, byte[] buffer, AsyncContinuation continuation)
-		{
-			var toSend = buffer.Length;
-			if (toSend <= MaxMessageSize)
-			{
-				// Chunking is not needed, no need to perform delegate capture
-				InternalLogger.Trace("{0}: Sending chunk, position: {1}, length: {2}", nameof(FastNetworkTarget), 0, toSend);
-				if (toSend <= 0)
-				{
-					continuation(null);
-					return;
-				}
-
-				sender.Send(buffer, 0, toSend, continuation);
-			}
-			else
-			{
-				var pos = 0;
-
-				void SendNextChunk(Exception ex)
-				{
-					if (ex != null)
-					{
-						continuation(ex);
-						return;
-					}
-
-					InternalLogger.Trace("{0}: Sending chunk, position: {1}, length: {2}", nameof(FastNetworkTarget), pos, toSend);
-					if (toSend <= 0)
-					{
-						continuation(null);
-						return;
-					}
-
-					var chunksize = toSend;
-					if (chunksize > MaxMessageSize)
-					{
-						if (OnOverflow == NetworkTargetOverflowAction.Discard)
-						{
-							InternalLogger.Trace("{0}: Discard because chunksize > this.MaxMessageSize", nameof(FastNetworkTarget));
-							continuation(null);
-							return;
-						}
-
-						if (OnOverflow == NetworkTargetOverflowAction.Error)
-						{
-							continuation(new OverflowException($"Attempted to send a message larger than MaxMessageSize ({MaxMessageSize}). Actual size was: {buffer.Length}. Adjust OnOverflow and MaxMessageSize parameters accordingly."));
-							return;
-						}
-
-						chunksize = MaxMessageSize;
-					}
-
-					var pos0 = pos;
-					toSend -= chunksize;
-					pos += chunksize;
-
-					sender.Send(buffer, pos0, chunksize, SendNextChunk);
-				}
-
-				SendNextChunk(null);
-			}
-		}
-
-		private byte[] GetBytesFromStringBuilder(char[] charBuffer, StringBuilder stringBuilder)
-		{
-			if (stringBuilder.Length <= charBuffer.Length)
-			{
-				stringBuilder.CopyTo(0, charBuffer, 0, stringBuilder.Length);
-				return Encoding.GetBytes(charBuffer, 0, stringBuilder.Length);
-			}
-
-			return Encoding.GetBytes(stringBuilder.ToString());
-		}
-
-		private byte[] GetBytesFromString(char[] charBuffer, string layoutMessage)
-		{
-			if (layoutMessage.Length <= charBuffer.Length)
-			{
-				layoutMessage.CopyTo(0, charBuffer, 0, layoutMessage.Length);
-				return Encoding.GetBytes(charBuffer, 0, layoutMessage.Length);
-			}
-
-			return Encoding.GetBytes(layoutMessage);
-		}
-
-		private byte[] GetBytesToWrite(LogEventInfo logEvent)
-		{
-			if (OptimizeBufferReuse)
-			{
-				using (var localBuffer = _reusableEncodingBuffer.Allocate())
-				{
-					if (!NewLine && TryGetCachedLayoutValue(logEvent, Layout, out var text))
-					{
-						return GetBytesFromString(localBuffer.Result, text?.ToString() ?? string.Empty);
-					}
-					else
-					{
-						using (var localBuilder = _reusableLayoutBuilder.Allocate())
-						{
-							RenderAppendBuilder(Layout, logEvent, localBuilder.Result, false);
-
-							if (NewLine)
-								localBuilder.Result.Append(LineEnding.NewLineCharacters);
-
-							return GetBytesFromStringBuilder(localBuffer.Result, localBuilder.Result);
-						}
-					}
-				}
-			}
-			else
-			{
-				var rendered = Layout.Render(logEvent);
-				InternalLogger.Trace("NetworkTarget(Name={0}): Sending: {1}", Name, rendered);
-				if (NewLine)
-				{
-					rendered += LineEnding.NewLineCharacters;
-				}
-				return Encoding.GetBytes(rendered);
-			}
-		}
-
-		#endregion
-
-		protected override void FlushAsync(AsyncContinuation asyncContinuation)
-		{
-			int remainingCount;
-
-			void Continuation(Exception ex)
-			{
-				// Ignore exception
-				if (Interlocked.Decrement(ref remainingCount) == 0)
-					asyncContinuation(null);
-			}
-
-			lock (_openNetworkSenders)
-			{
-				remainingCount = _openNetworkSenders.Count;
-				if (remainingCount == 0)
-				{
-					// Nothing to flush
-					asyncContinuation(null);
-				}
-				else
-				{
-					// Otherwise call FlushAsync() on all senders and invoke continuation at the very end
-					foreach (var openSender in _openNetworkSenders)
-						openSender.FlushAsync(Continuation);
-				}
+				var addr = simple.FixedText;
+				if (!string.IsNullOrWhiteSpace(addr))
+					_fixedSender = GetOrCreateSender(addr);
 			}
 		}
 
@@ -417,113 +357,413 @@ namespace NLog.Targets
 		{
 			base.CloseTarget();
 
+			_fixedSender?.Close(ex => { });
+			_fixedSender = null;
+
+			foreach (var pair in _senderMap)
+				pair.Value.Close(ex => { });
+
+			_senderMap.Clear();
+
 			lock (_openNetworkSenders)
 			{
-				foreach (var openSender in _openNetworkSenders)
-					openSender.Close(ex => { });
-
 				_openNetworkSenders.Clear();
+			}
+
+			lock (_currentSenderCache)
+			{
+				_currentSenderCache.Clear();
 			}
 		}
 
-		protected override void Write(AsyncLogEventInfo logEvent)
+		protected override void FlushAsync(AsyncContinuation asyncContinuation)
 		{
-			var address = RenderLogEvent(Address, logEvent.LogEvent);
-			var bytes = GetBytesToWrite(logEvent.LogEvent);
-
-			if (KeepConnection)
+			var senders = new List<TcpNetworkSender>();
+			if (_fixedSender != null)
 			{
-				LinkedListNode<NetworkSender> senderNode;
-
-				try
-				{
-					senderNode = GetCachedNetworkSender(address);
-				}
-				catch (Exception ex)
-				{
-					InternalLogger.Error(ex, "NetworkTarget(Name={0}): Failed to create sender to address: '{1}'", Name, address);
-					throw;
-				}
-
-				ChunkedSend(
-					senderNode.Value,
-					bytes,
-					ex =>
-					{
-						if (ex != null)
-							InternalLogger.Error(ex, "NetworkTarget(Name={0}): Error when sending.", Name);
-
-						logEvent.Continuation(ex);
-					});
+				senders.Add(_fixedSender);
 			}
 			else
 			{
-				NetworkSender sender;
-				LinkedListNode<NetworkSender> linkedListNode;
+				senders.AddRange(_senderMap.Values);
+			}
 
-				lock (_openNetworkSenders)
+			if (senders.Count == 0)
+			{
+				asyncContinuation(null);
+				return;
+			}
+
+			int remaining = senders.Count;
+			void Continuation(Exception ex)
+			{
+				if (Interlocked.Decrement(ref remaining) == 0)
+					asyncContinuation(null);
+			}
+
+			foreach (var sender in senders)
+				sender.FlushAsync(Continuation);
+		}
+
+		#endregion
+
+		#region Sender Management
+
+		private static AddressFamily DetectAddressFamily(string url)
+		{
+			if (url.StartsWith("tcp4://", StringComparison.OrdinalIgnoreCase))
+				return AddressFamily.InterNetwork;
+
+			if (url.StartsWith("tcp6://", StringComparison.OrdinalIgnoreCase))
+				return AddressFamily.InterNetworkV6;
+
+			return AddressFamily.Unspecified;
+		}
+
+		private TcpNetworkSender CreateTcpSender(string url)
+		{
+			var af = DetectAddressFamily(url);
+			var sender = new TcpNetworkSender(url, af)
+			{
+				ConnectionTimeout = TimeSpan.FromMilliseconds(ConnectionTimeout),
+				KeepAliveTime = TimeSpan.FromMilliseconds(KeepAliveTime),
+				SslProtocols = SslProtocols,
+				MaxQueueSize = MaxQueueSize,
+				NoDelay = NoDelay,
+				SendTimeout = SendTimeout,
+				SendBufferSize = SendBufferSize,
+				BatchSize = BatchSize,
+				MaxBatchBytes = MaxBatchBytes,
+				OnQueueOverflow = OnQueueOverflow
+			};
+
+			sender.Initialize();
+
+			// Populate legacy reflection structures for NLogStatsFetcher backward compatibility
+			lock (_openNetworkSenders)
+			{
+				var node = _openNetworkSenders.AddLast(sender);
+				lock (_currentSenderCache)
 				{
-					var tooManyConnections = _openNetworkSenders.Count >= MaxConnections;
-
-					if (tooManyConnections && MaxConnections > 0)
-					{
-						switch (OnConnectionOverflow)
-						{
-							case NetworkTargetConnectionsOverflowAction.DiscardMessage:
-								InternalLogger.Warn("NetworkTarget(Name={0}): Discarding message otherwise to many connections.", Name);
-								logEvent.Continuation(null);
-								return;
-
-							case NetworkTargetConnectionsOverflowAction.AllowNewConnnection:
-								InternalLogger.Debug("NetworkTarget(Name={0}): Too may connections, but this is allowed", Name);
-								break;
-
-							case NetworkTargetConnectionsOverflowAction.Block:
-								while (_openNetworkSenders.Count >= MaxConnections)
-								{
-									InternalLogger.Debug("NetworkTarget(Name={0}): Blocking networktarget otherwhise too many connections.", Name);
-									Monitor.Wait(_openNetworkSenders);
-									InternalLogger.Trace("NetworkTarget(Name={0}): Entered critical section.", Name);
-								}
-
-								InternalLogger.Trace("NetworkTarget(Name={0}): Limit ok.", Name);
-								break;
-						}
-					}
-
-					try
-					{
-						sender = CreateNetworkSender(address);
-					}
-					catch (Exception ex)
-					{
-						InternalLogger.Error(ex, "NetworkTarget(Name={0}): Failed to create sender to address: '{1}'", Name, address);
-						throw;
-					}
-
-					linkedListNode = _openNetworkSenders.AddLast(sender);
+					_currentSenderCache[url] = node;
 				}
+			}
 
-				ChunkedSend(
-					sender,
-					bytes,
-					ex =>
-					{
-						lock (_openNetworkSenders)
-						{
-							TryRemove(_openNetworkSenders, linkedListNode);
+			return sender;
+		}
 
-							if (OnConnectionOverflow == NetworkTargetConnectionsOverflowAction.Block)
-								Monitor.PulseAll(_openNetworkSenders);
-						}
+		private TcpNetworkSender GetOrCreateSender(string address)
+		{
+			if (_fixedSender != null)
+				return _fixedSender;
 
-						if (ex != null)
-							InternalLogger.Error(ex, "NetworkTarget(Name={0}): Error when sending.", Name);
+			if (_senderMap.TryGetValue(address, out var sender))
+				return sender;
 
-						sender.Close(ex2 => { });
-						logEvent.Continuation(ex);
-					});
+			lock (_currentSenderCache)
+			{
+				return _senderMap.GetOrAdd(address, CreateTcpSender);
 			}
 		}
+
+		#endregion
+
+		#region Layout Rendering & Encoding Helpers
+
+		private static bool TryGetCachedLayoutValue(LogEventInfo logEvent, Layout layout, out object text)
+		{
+			if (_tryGetCachedLayoutValueFn != null)
+				return _tryGetCachedLayoutValueFn(logEvent, layout, out text);
+
+			if (_tryGetCachedLayoutValueMethod != null)
+			{
+				var args = new[] { layout, (object)null };
+				var result = (bool)_tryGetCachedLayoutValueMethod.Invoke(logEvent, args);
+				text = args[1];
+				return result;
+			}
+
+			text = null;
+			return false;
+		}
+
+		private static void RenderAppendBuilder(Layout layout, LogEventInfo logEvent, StringBuilder target, bool cacheLayoutResult = false)
+		{
+			if (_renderAppendBuilderFn != null)
+			{
+				_renderAppendBuilderFn(layout, logEvent, target, cacheLayoutResult);
+				return;
+			}
+
+			if (_renderAppendBuilderMethod != null)
+			{
+				_renderAppendBuilderMethod.Invoke(layout, new object[] { logEvent, target, cacheLayoutResult });
+				return;
+			}
+
+			target.Append(layout.Render(logEvent));
+		}
+
+		private int EncodeLogEvent(LogEventInfo logEvent, byte[] destBuffer, int destOffset)
+		{
+			int maxAvailable = destBuffer.Length - destOffset - _newLineBytes.Length;
+			if (maxAvailable <= 0)
+				return -1;
+
+			if (TryGetCachedLayoutValue(logEvent, Layout, out var cachedText) && cachedText != null)
+			{
+				string str = cachedText.ToString();
+				int byteCount = Encoding.GetByteCount(str);
+				if (byteCount > maxAvailable)
+					return -1;
+
+				int written = Encoding.GetBytes(str, 0, str.Length, destBuffer, destOffset);
+				if (_newLineBytes.Length > 0)
+				{
+					Buffer.BlockCopy(_newLineBytes, 0, destBuffer, destOffset + written, _newLineBytes.Length);
+					written += _newLineBytes.Length;
+				}
+				return written;
+			}
+
+			var sb = t_threadBuilder ?? (t_threadBuilder = new StringBuilder(1024));
+			sb.Clear();
+
+			RenderAppendBuilder(Layout, logEvent, sb, false);
+
+			int charLen = sb.Length;
+			var charBuf = t_threadCharBuffer;
+			if (charBuf == null || charBuf.Length < charLen)
+				t_threadCharBuffer = charBuf = new char[Math.Max(charLen, 2048)];
+
+			sb.CopyTo(0, charBuf, 0, charLen);
+
+			int reqBytes = Encoding.GetByteCount(charBuf, 0, charLen);
+			if (reqBytes > maxAvailable)
+				return -1;
+
+			int enc = Encoding.GetBytes(charBuf, 0, charLen, destBuffer, destOffset);
+			if (_newLineBytes.Length > 0)
+			{
+				Buffer.BlockCopy(_newLineBytes, 0, destBuffer, destOffset + enc, _newLineBytes.Length);
+				enc += _newLineBytes.Length;
+			}
+			return enc;
+		}
+
+		private byte[] RenderToRentedBuffer(LogEventInfo logEvent, out int totalLength)
+		{
+			if (TryGetCachedLayoutValue(logEvent, Layout, out var cachedText) && cachedText != null)
+			{
+				string str = cachedText.ToString();
+				int byteCount = Encoding.GetByteCount(str);
+				int total = byteCount + _newLineBytes.Length;
+
+				byte[] buf = ByteBufferPool.Rent(total);
+				int enc = Encoding.GetBytes(str, 0, str.Length, buf, 0);
+
+				if (_newLineBytes.Length > 0)
+					Buffer.BlockCopy(_newLineBytes, 0, buf, enc, _newLineBytes.Length);
+
+				totalLength = total;
+				return buf;
+			}
+
+			var sb = t_threadBuilder ?? (t_threadBuilder = new StringBuilder(1024));
+			sb.Clear();
+
+			RenderAppendBuilder(Layout, logEvent, sb, false);
+
+			int charLen = sb.Length;
+			var charBuf = t_threadCharBuffer;
+			if (charBuf == null || charBuf.Length < charLen)
+				t_threadCharBuffer = charBuf = new char[Math.Max(charLen, 2048)];
+
+			sb.CopyTo(0, charBuf, 0, charLen);
+
+			int reqBytes = Encoding.GetByteCount(charBuf, 0, charLen);
+			int fullTotal = reqBytes + _newLineBytes.Length;
+
+			byte[] rented = ByteBufferPool.Rent(fullTotal);
+			int written = Encoding.GetBytes(charBuf, 0, charLen, rented, 0);
+
+			if (_newLineBytes.Length > 0)
+				Buffer.BlockCopy(_newLineBytes, 0, rented, written, _newLineBytes.Length);
+
+			totalLength = fullTotal;
+			return rented;
+		}
+
+		#endregion
+
+		#region High-Performance ThreadSafe Overrides (Lock-Free Hot Path)
+
+		protected override void WriteAsyncThreadSafe(AsyncLogEventInfo logEvent)
+		{
+			if (!IsInitialized)
+			{
+				logEvent.Continuation(null);
+				return;
+			}
+
+			Write(logEvent);
+		}
+
+		protected override void WriteAsyncThreadSafe(IList<AsyncLogEventInfo> logEvents)
+		{
+			if (!IsInitialized)
+			{
+				for (int i = 0; i < logEvents.Count; i++)
+					logEvents[i].Continuation(null);
+				return;
+			}
+
+			Write(logEvents);
+		}
+
+		#endregion
+
+		#region Write Implementation
+
+		protected override void Write(AsyncLogEventInfo logEvent)
+		{
+			TcpNetworkSender sender;
+			if (_fixedSender != null)
+			{
+				sender = _fixedSender;
+			}
+			else
+			{
+				var address = RenderLogEvent(Address, logEvent.LogEvent);
+				if (string.IsNullOrWhiteSpace(address))
+				{
+					logEvent.Continuation(null);
+					return;
+				}
+				sender = GetOrCreateSender(address);
+			}
+
+			byte[] buf = RenderToRentedBuffer(logEvent.LogEvent, out int len);
+
+			// Check MaxMessageSize overflow
+			if (len > MaxMessageSize)
+			{
+				if (OnOverflow == NetworkTargetOverflowAction.Discard)
+				{
+					ByteBufferPool.Return(buf);
+					logEvent.Continuation(null);
+					return;
+				}
+
+				if (OnOverflow == NetworkTargetOverflowAction.Error)
+				{
+					ByteBufferPool.Return(buf);
+					logEvent.Continuation(new OverflowException($"Attempted to send a message larger than MaxMessageSize ({MaxMessageSize}). Actual size was: {len}."));
+					return;
+				}
+
+				// Split: send in MaxMessageSize chunks
+				int pos = 0;
+				int toSend = len;
+				while (toSend > 0)
+				{
+					int chunkSize = Math.Min(toSend, MaxMessageSize);
+					byte[] chunkBuf = ByteBufferPool.Rent(chunkSize);
+					Buffer.BlockCopy(buf, pos, chunkBuf, 0, chunkSize);
+
+					pos += chunkSize;
+					toSend -= chunkSize;
+
+					var cont = toSend == 0 ? logEvent.Continuation : null;
+					sender.Send(chunkBuf, 0, chunkSize, cont);
+				}
+
+				ByteBufferPool.Return(buf);
+				return;
+			}
+
+			sender.Send(buf, 0, len, logEvent.Continuation);
+		}
+
+		protected override void Write(IList<AsyncLogEventInfo> logEvents)
+		{
+			int count = logEvents.Count;
+			if (count == 0)
+				return;
+
+			if (count == 1)
+			{
+				Write(logEvents[0]);
+				return;
+			}
+
+			// Producer-side Slab Coalescing into 64KB buffers
+			TcpNetworkSender sender = _fixedSender;
+			byte[] slab = null;
+			int slabOffset = 0;
+
+			for (int i = 0; i < count; i++)
+			{
+				var asyncEvent = logEvents[i];
+
+				if (sender == null)
+				{
+					var address = RenderLogEvent(Address, asyncEvent.LogEvent);
+					if (string.IsNullOrWhiteSpace(address))
+					{
+						asyncEvent.Continuation(null);
+						continue;
+					}
+					sender = GetOrCreateSender(address);
+				}
+
+				if (slab == null)
+				{
+					slab = ByteBufferPool.Rent(ByteBufferPool.Size64K);
+					slabOffset = 0;
+				}
+
+				int written = EncodeLogEvent(asyncEvent.LogEvent, slab, slabOffset);
+				if (written > 0)
+				{
+					slabOffset += written;
+					asyncEvent.Continuation(null);
+				}
+				else
+				{
+					// Slab full: dispatch current slab
+					if (slabOffset > 0)
+					{
+						sender.Send(slab, 0, slabOffset, null);
+						slab = ByteBufferPool.Rent(ByteBufferPool.Size64K);
+						slabOffset = 0;
+					}
+
+					// Try again in fresh slab
+					written = EncodeLogEvent(asyncEvent.LogEvent, slab, slabOffset);
+					if (written > 0)
+					{
+						slabOffset += written;
+						asyncEvent.Continuation(null);
+					}
+					else
+					{
+						// Message alone exceeds 64KB or MaxMessageSize: fall back to single Write
+						Write(asyncEvent);
+					}
+				}
+			}
+
+			if (slab != null && slabOffset > 0 && sender != null)
+			{
+				sender.Send(slab, 0, slabOffset, null);
+			}
+			else if (slab != null && slabOffset == 0)
+			{
+				ByteBufferPool.Return(slab);
+			}
+		}
+
+		#endregion
 	}
 }

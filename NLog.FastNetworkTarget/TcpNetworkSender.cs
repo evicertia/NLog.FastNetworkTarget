@@ -2,43 +2,120 @@
 using System.Threading;
 using System.Diagnostics;
 using System.Net.Sockets;
-using System.Collections.Concurrent;
+using System.Collections;
 using System.Security.Authentication;
 using System.Runtime.CompilerServices;
 
 using NLog.Common;
+using NLog.Targets;
 
 namespace NLog.Internal.NetworkSenders
 {
 	internal class TcpNetworkSender : NetworkSender
 	{
-		#region Inner types
+		#region Constants & Signals
 
-		private struct Item
+		private const int SIGNAL_DATA = 0;
+		private const int CLOSE_SIGNAL = -31337;
+		private const int FLUSH_SIGNAL = -31338;
+
+		private const int STATE_RUNNING = 0;
+		private const int STATE_SLEEPING = 1;
+
+		#endregion
+
+		#region Ring Buffer Slot Structure
+
+		private struct Slot
 		{
-			public AsyncContinuation continuation;
-			public byte[] bytes;
-			public int length;
+			public int Sequence;
+			public byte[] Buffer;
+			public int Offset;
+			public int Length;
+			public AsyncContinuation Continuation;
+			public int Signal;
 		}
 
 		#endregion
 
-		#region Common fields & properties
+		#region QueueShim for Herma.Facilities NLogStatsFetcher reflection backward compatibility
 
-		private static bool? EnableKeepAliveSuccessful;
-		private const int CLOSE_SIGNAL = -31337;
-		private const int FLUSH_SIGNAL = -31338;
-		private BlockingCollection<Item> _items;
-		private Uri _uri;
+		private readonly QueueShim _items;
 
-		private readonly CancellationTokenSource _cancellator = new CancellationTokenSource();
+		private sealed class QueueShim : ICollection
+		{
+			private readonly TcpNetworkSender _owner;
+
+			public QueueShim(TcpNetworkSender owner)
+			{
+				_owner = owner;
+			}
+
+			public int Count => (int)_owner.PendingMessages;
+			public object SyncRoot => this;
+			public bool IsSynchronized => false;
+
+			public void CopyTo(Array array, int index) { }
+			public IEnumerator GetEnumerator()
+			{
+				return System.Linq.Enumerable.Empty<object>().GetEnumerator();
+			}
+		}
+
+		#endregion
+
+		#region Fields & Properties
+
 		private readonly object _lock = new object();
+		private readonly AutoResetEvent _dataAvailable = new AutoResetEvent(false);
+		private readonly AutoResetEvent _spaceAvailable = new AutoResetEvent(false);
 
+		private volatile bool _isClosed;
+		private volatile Thread _thread;
+		private ISocket _socket;
+		private Uri _uri;
+		private bool? _enableKeepAliveSuccessful;
+
+		// Bounded MPSC Ring Buffer
+		private Slot[] _ring;
+		private int _capacity;
+		private int _mask;
+		private int _enqueuePos;
+		private int _dequeuePos;
+		private int _consumerState;
+
+		// Observability Metrics
+		private long _sentMessages;
+		private long _sentBytes;
+		private long _sentBatches;
+		private long _droppedMessages;
+		private long _blockedEnqueues;
+		private long _sendFailures;
+		private long _reconnectCount;
+
+		// Batching & Socket Options
 		internal AddressFamily AddressFamily { get; set; }
 		internal SslProtocols SslProtocols { get; set; }
 		internal TimeSpan KeepAliveTime { get; set; }
-		internal TimeSpan ConnectionTimeout { get; set; }
-		internal int MaxQueueSize { get; set; }
+		internal TimeSpan ConnectionTimeout { get; set; } = TimeSpan.FromSeconds(1);
+		internal int MaxQueueSize { get; set; } = 8192;
+
+		public bool NoDelay { get; set; } = true;
+		public int SendTimeout { get; set; } = 30000;
+		public int SendBufferSize { get; set; } = 256 * 1024;
+		public int BatchSize { get; set; } = 512;
+		public int MaxBatchBytes { get; set; } = 256 * 1024;
+		public NetworkTargetQueueOverflowAction OnQueueOverflow { get; set; } = NetworkTargetQueueOverflowAction.Discard;
+
+		// Public Metrics
+		public long PendingMessages => Math.Max(0, Volatile.Read(ref _enqueuePos) - Volatile.Read(ref _dequeuePos));
+		public long SentMessages => Volatile.Read(ref _sentMessages);
+		public long SentBytes => Volatile.Read(ref _sentBytes);
+		public long SentBatches => Volatile.Read(ref _sentBatches);
+		public long DroppedMessages => Volatile.Read(ref _droppedMessages);
+		public long BlockedEnqueues => Volatile.Read(ref _blockedEnqueues);
+		public long SendFailures => Volatile.Read(ref _sendFailures);
+		public long ReconnectCount => Volatile.Read(ref _reconnectCount);
 
 		#endregion
 
@@ -48,11 +125,12 @@ namespace NLog.Internal.NetworkSenders
 			: base(url)
 		{
 			AddressFamily = addressFamily;
+			_items = new QueueShim(this);
 		}
 
 		#endregion
 
-		#region NetworkSender methods
+		#region NetworkSender lifecycle
 
 		protected override void DoInitialize()
 		{
@@ -63,10 +141,26 @@ namespace NLog.Internal.NetworkSenders
 					if (_thread == null)
 					{
 						_uri = new Uri(Address);
-						_items = new BlockingCollection<Item>(MaxQueueSize);
+
+						// Compute power of 2 ring capacity >= MaxQueueSize (minimum 16)
+						int cap = 16;
+						while (cap < MaxQueueSize)
+							cap <<= 1;
+
+						_capacity = cap;
+						_mask = cap - 1;
+						_ring = new Slot[_capacity];
+
+						for (int i = 0; i < _capacity; i++)
+							_ring[i].Sequence = i;
+
+						_enqueuePos = 0;
+						_dequeuePos = 0;
+
 						_thread = new Thread(Main)
 						{
-							Name = $"{nameof(TcpNetworkSender)} - {Address}"
+							Name = $"{nameof(TcpNetworkSender)} - {Address}",
+							IsBackground = true
 						};
 
 						_thread.Start();
@@ -79,47 +173,111 @@ namespace NLog.Internal.NetworkSenders
 
 		protected override void DoSend(byte[] bytes, int offset, int length, AsyncContinuation asyncContinuation)
 		{
-			if (!_items.IsCompleted)
-				_items.Add(new Item { bytes = bytes, length = length, continuation = asyncContinuation }, _cancellator.Token);
+			if (_isClosed)
+			{
+				ByteBufferPool.Return(bytes);
+				asyncContinuation?.Invoke(new InvalidOperationException("NetworkSender is closed."));
+				return;
+			}
+
+			EnqueueItem(bytes, offset, length, asyncContinuation, SIGNAL_DATA);
 		}
 
 		protected override void DoFlush(AsyncContinuation continuation)
 		{
-			if (_items.IsCompleted)
+			if (_isClosed)
 			{
 				continuation?.Invoke(null);
 				return;
 			}
 
-			_items.Add(new Item { length = FLUSH_SIGNAL, continuation = continuation }, _cancellator.Token);
+			EnqueueItem(null, 0, 0, continuation, FLUSH_SIGNAL);
 		}
 
 		protected override void DoClose(AsyncContinuation continuation)
 		{
-			if (_items.IsCompleted)
+			if (_isClosed)
 			{
 				continuation?.Invoke(null);
 				return;
 			}
 
-			lock (_items)
-			{
-				continuation = ex => { _thread.Join(); continuation?.Invoke(ex); };
-				_items.Add(new Item { length = CLOSE_SIGNAL, continuation = continuation });
-				_cancellator.Cancel();
-				_items.CompleteAdding();
-			}
+			_isClosed = true;
+			EnqueueItem(null, 0, 0, continuation, CLOSE_SIGNAL);
 		}
 
 		#endregion
 
-		#region Thread methods
+		#region Enqueue Logic
 
-		private volatile Thread _thread;
-		private ISocket _socket;
+		private void EnqueueItem(byte[] bytes, int offset, int length, AsyncContinuation continuation, int signal)
+		{
+			while (!_isClosed || signal == CLOSE_SIGNAL)
+			{
+				int head = Volatile.Read(ref _enqueuePos);
+				int tail = Volatile.Read(ref _dequeuePos);
+
+				if (head - tail >= _capacity)
+				{
+					if (signal == CLOSE_SIGNAL)
+					{
+						// Close signal must never be dropped; yield briefly
+						Thread.Sleep(1);
+						continue;
+					}
+
+					if (OnQueueOverflow == NetworkTargetQueueOverflowAction.Discard)
+					{
+						Interlocked.Increment(ref _droppedMessages);
+						if (bytes != null)
+							ByteBufferPool.Return(bytes);
+
+						continuation?.Invoke(null);
+						return;
+					}
+					else // Block
+					{
+						Interlocked.Increment(ref _blockedEnqueues);
+						_spaceAvailable.WaitOne(50);
+						continue;
+					}
+				}
+
+				if (Interlocked.CompareExchange(ref _enqueuePos, head + 1, head) == head)
+				{
+					int index = head & _mask;
+					var spinner = new SpinWait();
+
+					while (Volatile.Read(ref _ring[index].Sequence) != head)
+						spinner.SpinOnce();
+
+					_ring[index].Buffer = bytes;
+					_ring[index].Offset = offset;
+					_ring[index].Length = length;
+					_ring[index].Continuation = continuation;
+					_ring[index].Signal = signal;
+
+					Volatile.Write(ref _ring[index].Sequence, head + 1);
+
+					if (Volatile.Read(ref _consumerState) == STATE_SLEEPING)
+						_dataAvailable.Set();
+
+					return;
+				}
+			}
+
+			// Closed
+			if (bytes != null)
+				ByteBufferPool.Return(bytes);
+
+			continuation?.Invoke(null);
+		}
+
+		#endregion
+
+		#region Socket & Thread Methods
 
 		private static readonly int[] DelayIntervals = new[] { 50, 100, 250, 500, 1000 };
-
 		private static int GetDelay(uint step) => DelayIntervals[Math.Min(DelayIntervals.Length - 1, step)];
 
 		private static bool TrySetSocketOption(Socket socket, SocketOptionLevel level, SocketOptionName name, object value)
@@ -140,34 +298,23 @@ namespace NLog.Internal.NetworkSenders
 		{
 			if (TrySetSocketOption(socket, SocketOptionLevel.Socket, SocketOptionName.KeepAlive, true))
 			{
-				// SOCKET OPTION NAME CONSTANT
-				// Ws2ipdef.h (Windows SDK)
-				// #define    TCP_KEEPALIVE      3
-				// #define    TCP_KEEPINTVL      17
 				var TcpKeepAliveTime = (SocketOptionName)0x3;
 				var TcpKeepAliveInterval = (SocketOptionName)0x11;
 
 				if (PlatformDetector.CurrentOS == RuntimeOS.Linux)
 				{
-					// https://github.com/torvalds/linux/blob/v4.16/include/net/tcp.h
-					// #define    TCP_KEEPIDLE            4              /* Start keepalives after this period */
-					// #define    TCP_KEEPINTVL           5              /* Interval between keepalives */
 					TcpKeepAliveTime = (SocketOptionName)0x4;
 					TcpKeepAliveInterval = (SocketOptionName)0x5;
 				}
 				else if (PlatformDetector.CurrentOS == RuntimeOS.MacOSX)
 				{
-					// https://opensource.apple.com/source/xnu/xnu-4570.41.2/bsd/netinet/tcp.h.auto.html
-					// #define    TCP_KEEPALIVE      0x10                      /* idle time used when SO_KEEPALIVE is enabled */
-					// #define    TCP_KEEPINTVL      0x101                     /* interval between keepalives */
 					TcpKeepAliveTime = (SocketOptionName)0x10;
 					TcpKeepAliveInterval = (SocketOptionName)0x101;
 				}
 
 				if (TrySetSocketOption(socket, SocketOptionLevel.Tcp, TcpKeepAliveTime, keepAliveTimeSeconds))
 				{
-					// Configure retransmission interval when missing acknowledge of keep-alive-probe
-					TrySetSocketOption(socket, SocketOptionLevel.Tcp, TcpKeepAliveInterval, 1); //< Default 1 sec on Windows (75 sec on Linux)
+					TrySetSocketOption(socket, SocketOptionLevel.Tcp, TcpKeepAliveInterval, 1);
 					return true;
 				}
 			}
@@ -177,13 +324,29 @@ namespace NLog.Internal.NetworkSenders
 
 		protected internal virtual ISocket CreateSocket(string host, AddressFamily addressFamily, SocketType socketType, ProtocolType protocolType)
 		{
-			var result = new SocketProxy(addressFamily, socketType, protocolType);
+			var socketAf = addressFamily == AddressFamily.Unspecified ? AddressFamily.InterNetwork : addressFamily;
+			var result = new SocketProxy(socketAf, socketType, protocolType);
 			var socket = result.UnderlyingSocket;
 
-			if (KeepAliveTime.TotalSeconds >= 1.0 && EnableKeepAliveSuccessful != false)
-				EnableKeepAliveSuccessful = TryEnableKeepAlive(socket, (int)KeepAliveTime.TotalSeconds);
+			if (NoDelay)
+			{
+				try { socket.NoDelay = true; } catch { }
+			}
 
-			if (SslProtocols != SslProtocols.None) //< TODO: Implement ssl socket connection..
+			if (SendTimeout > 0)
+			{
+				try { socket.SendTimeout = SendTimeout; } catch { }
+			}
+
+			if (SendBufferSize > 0)
+			{
+				try { socket.SendBufferSize = SendBufferSize; } catch { }
+			}
+
+			if (KeepAliveTime.TotalSeconds >= 1.0 && _enableKeepAliveSuccessful != false)
+				_enableKeepAliveSuccessful = TryEnableKeepAlive(socket, (int)KeepAliveTime.TotalSeconds);
+
+			if (SslProtocols != SslProtocols.None)
 				throw new NotImplementedException("SSL socket connection not implemented.");
 
 			return result;
@@ -193,91 +356,48 @@ namespace NLog.Internal.NetworkSenders
 		{
 			_socket = CreateSocket(_uri.Host, AddressFamily, SocketType.Stream, ProtocolType.Tcp);
 
-			var asyncResult = _socket.BeginConnect(ParseEndpointAddress(new Uri(Address), AddressFamily), null, null);
+			var endpoint = ParseEndpointAddress(_uri, AddressFamily);
+			var asyncResult = _socket.BeginConnect(endpoint, null, null);
 			var signalReceived = asyncResult.AsyncWaitHandle.WaitOne(ConnectionTimeout, true);
 
 			if (!signalReceived)
 			{
-				try
-				{
-					Close(); //< XXX: Timeout reached? Close and throw.
-				}
-				catch { }
-
+				try { CloseSocket(); } catch { }
 				throw new SocketException((int)SocketError.TimedOut);
 			}
 
 			_socket.EndConnect(asyncResult);
 		}
 
-		private void Send(Item item)
-		{
-			var left = item.length;
-
-			while (left > 0)
-			{
-				try
-				{
-					left -= _socket.Send(item.bytes, (item.length - left), left, SocketFlags.None);
-					item.continuation?.Invoke(null);
-				}
-				catch (Exception ex) when (item.continuation != null)
-				{
-					item.continuation(ex);
-					throw;
-				}
-			}
-		}
-
-		private void Close()
+		private void CloseSocket()
 		{
 			var sock = _socket;
 			_socket = null;
 
-			if (sock?.Connected != null)
-				sock.Close();
-
-			sock?.Dispose();
-		}
-
-		private void Close(Item item)
-		{
-
-			try
+			if (sock != null)
 			{
-				Close();
+				try
+				{
+					if (sock.Connected)
+						sock.Close();
+				}
+				catch { }
 
-				item.continuation?.Invoke(null);
-			}
-			catch (Exception exception)
-			{
-				item.continuation?.Invoke(exception);
+				try { sock.Dispose(); } catch { }
 			}
 		}
 
-		[MethodImpl(MethodImplOptions.AggressiveInlining)]
-		private bool DoWork()
+		private void SendFully(byte[] buffer, int offset, int count)
 		{
-			if (_socket?.Connected != true)
+			int left = count;
+			while (left > 0)
 			{
-				Close();
-				Connect();
-			}
+				int sent = _socket.Send(buffer, offset + (count - left), left, SocketFlags.None);
+				if (sent <= 0)
+					throw new SocketException((int)SocketError.ConnectionReset);
 
-			var item = _items.Take();
-			if (item.length == CLOSE_SIGNAL)
-			{
-				Close(item);
-				return false;
+				left -= sent;
 			}
-			else if (item.length == FLUSH_SIGNAL)
-			{
-				item.continuation?.Invoke(null);
-				return true;
-			}
-
-			Send(item);
-			return true;
 		}
 
 		private void Main()
@@ -285,43 +405,252 @@ namespace NLog.Internal.NetworkSenders
 			uint step = 0;
 			var sw = new Stopwatch();
 
+			// Persistent send coalescing buffer
+			int maxBatchBytes = Math.Max(64 * 1024, MaxBatchBytes);
+			int maxBatchCount = Math.Max(1, BatchSize);
+
+#if NET8_0_OR_GREATER
+			byte[] sendBuffer = GC.AllocateUninitializedArray<byte>(maxBatchBytes, pinned: true);
+#else
+			byte[] sendBuffer = new byte[maxBatchBytes];
+#endif
+			AsyncContinuation[] batchContinuations = new AsyncContinuation[maxBatchCount];
+
 			while (true)
 			{
 				try
 				{
-					if (!DoWork())
-						break;
+					if (_socket == null || !_socket.Connected)
+					{
+						CloseSocket();
+						Connect();
+						Interlocked.Increment(ref _reconnectCount);
+					}
 
 					step = 0;
+
+					while (true)
+					{
+						int tail = _dequeuePos;
+						int head = Volatile.Read(ref _enqueuePos);
+
+						if (tail == head)
+						{
+							// Ring buffer empty - wait for data
+							Volatile.Write(ref _consumerState, STATE_SLEEPING);
+
+							// Double check
+							if (Volatile.Read(ref _enqueuePos) == tail)
+							{
+								_dataAvailable.WaitOne(50);
+							}
+
+							Volatile.Write(ref _consumerState, STATE_RUNNING);
+							continue;
+						}
+
+						int available = head - tail;
+						int batchLimit = Math.Min(available, maxBatchCount);
+						int batchBytes = 0;
+						int batchCount = 0;
+						bool encounteredClose = false;
+						AsyncContinuation closeContinuation = null;
+						bool encounteredFlush = false;
+						AsyncContinuation flushContinuation = null;
+
+						for (int i = 0; i < batchLimit; i++)
+						{
+							int pos = tail + i;
+							int index = pos & _mask;
+
+							if (Volatile.Read(ref _ring[index].Sequence) != pos + 1)
+								break; // Item not yet fully published by producer
+
+							int signal = _ring[index].Signal;
+							if (signal == CLOSE_SIGNAL)
+							{
+								encounteredClose = true;
+								closeContinuation = _ring[index].Continuation;
+								batchLimit = i + 1;
+								break;
+							}
+
+							if (signal == FLUSH_SIGNAL)
+							{
+								encounteredFlush = true;
+								flushContinuation = _ring[index].Continuation;
+								batchLimit = i + 1;
+								break;
+							}
+
+							int itemLen = _ring[index].Length;
+							if (batchBytes > 0 && batchBytes + itemLen > maxBatchBytes)
+							{
+								batchLimit = i;
+								break;
+							}
+
+							batchBytes += itemLen;
+							batchCount++;
+						}
+
+						if (batchCount == 0 && !encounteredClose && !encounteredFlush)
+						{
+							Thread.Yield();
+							continue;
+						}
+
+						// Process and send the batch
+						if (batchCount > 0)
+						{
+							if (batchCount == 1 && _ring[tail & _mask].Buffer != null && _ring[tail & _mask].Length > 0)
+							{
+								// Single item or large slab: send directly (zero-copy)
+								int idx = tail & _mask;
+								var buf = _ring[idx].Buffer;
+								var off = _ring[idx].Offset;
+								var len = _ring[idx].Length;
+								var cont = _ring[idx].Continuation;
+
+								Volatile.Write(ref _ring[idx].Sequence, tail + _capacity);
+								_dequeuePos = tail + 1;
+
+								if (OnQueueOverflow == NetworkTargetQueueOverflowAction.Block)
+									_spaceAvailable.Set();
+
+								try
+								{
+									SendFully(buf, off, len);
+									Interlocked.Increment(ref _sentMessages);
+									Interlocked.Add(ref _sentBytes, len);
+									Interlocked.Increment(ref _sentBatches);
+
+									cont?.Invoke(null);
+								}
+								catch (Exception sendEx)
+								{
+									cont?.Invoke(sendEx);
+									throw;
+								}
+								finally
+								{
+									ByteBufferPool.Return(buf);
+								}
+							}
+							else
+							{
+								// Multiple items: coalesce into sendBuffer
+								int writeOffset = 0;
+								for (int i = 0; i < batchCount; i++)
+								{
+									int pos = tail + i;
+									int idx = pos & _mask;
+									var buf = _ring[idx].Buffer;
+									var off = _ring[idx].Offset;
+									var len = _ring[idx].Length;
+
+									batchContinuations[i] = _ring[idx].Continuation;
+
+									if (buf != null && len > 0)
+									{
+										Buffer.BlockCopy(buf, off, sendBuffer, writeOffset, len);
+										writeOffset += len;
+										ByteBufferPool.Return(buf);
+									}
+
+									Volatile.Write(ref _ring[idx].Sequence, pos + _capacity);
+								}
+
+								_dequeuePos = tail + batchCount;
+
+								if (OnQueueOverflow == NetworkTargetQueueOverflowAction.Block)
+									_spaceAvailable.Set();
+
+								try
+								{
+									SendFully(sendBuffer, 0, writeOffset);
+
+									Interlocked.Add(ref _sentMessages, batchCount);
+									Interlocked.Add(ref _sentBytes, writeOffset);
+									Interlocked.Increment(ref _sentBatches);
+
+									for (int i = 0; i < batchCount; i++)
+										batchContinuations[i]?.Invoke(null);
+								}
+								catch (Exception sendEx)
+								{
+									for (int i = 0; i < batchCount; i++)
+										batchContinuations[i]?.Invoke(sendEx);
+									throw;
+								}
+							}
+						}
+
+						if (encounteredFlush)
+						{
+							int idx = (tail + batchLimit - 1) & _mask;
+							Volatile.Write(ref _ring[idx].Sequence, (tail + batchLimit - 1) + _capacity);
+							_dequeuePos = tail + batchLimit;
+
+							if (OnQueueOverflow == NetworkTargetQueueOverflowAction.Block)
+								_spaceAvailable.Set();
+
+							flushContinuation?.Invoke(null);
+						}
+
+						if (encounteredClose)
+						{
+							int idx = (tail + batchLimit - 1) & _mask;
+							Volatile.Write(ref _ring[idx].Sequence, (tail + batchLimit - 1) + _capacity);
+							_dequeuePos = tail + batchLimit;
+
+							CloseSocket();
+							closeContinuation?.Invoke(null);
+							return; // Thread exit
+						}
+					}
 				}
 				catch (Exception ex)
 				{
+					Interlocked.Increment(ref _sendFailures);
 					InternalLogger.Error(ex, "Unexpected error while sending log data to {0}", _uri);
 
-					var delay = GetDelay(step++);
-					var tmout = delay;
+					CloseSocket();
 
-					sw.Restart();
-
-					do
+					// Drain and fail pending queue items
+					int tail = _dequeuePos;
+					int head = Volatile.Read(ref _enqueuePos);
+					while (tail < head)
 					{
-						// XXX: Flush queue if sender is not connected..
-						while (_items.TryTake(out var item, tmout < 0 ? 0 : tmout))
+						int idx = tail & _mask;
+						if (Volatile.Read(ref _ring[idx].Sequence) == tail + 1)
 						{
-							if (item.length == CLOSE_SIGNAL)
+							var buf = _ring[idx].Buffer;
+							var cont = _ring[idx].Continuation;
+							int signal = _ring[idx].Signal;
+
+							if (buf != null)
+								ByteBufferPool.Return(buf);
+
+							Volatile.Write(ref _ring[idx].Sequence, tail + _capacity);
+							_dequeuePos = ++tail;
+
+							if (signal == CLOSE_SIGNAL)
 							{
-								Close(item);
-								goto done;
+								cont?.Invoke(null);
+								return;
 							}
 
-							item.continuation?.Invoke(ex);
-							tmout = (int)(delay - sw.ElapsedMilliseconds);
+							cont?.Invoke(ex);
+						}
+						else
+						{
+							break;
 						}
 					}
-					while (sw.ElapsedMilliseconds < delay);
 
-				done:
-					sw.Stop();
+					var delay = GetDelay(step++);
+					Thread.Sleep(delay);
 				}
 			}
 		}
