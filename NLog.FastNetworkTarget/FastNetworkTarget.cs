@@ -593,7 +593,7 @@ namespace NLog.Targets
 				ConnectionTimeout = TimeSpan.FromMilliseconds(ConnectionTimeout),
 				KeepAliveTime = TimeSpan.FromMilliseconds(KeepAliveTime),
 				SslProtocols = SslProtocols,
-				MaxQueueSize = MaxQueueSize,
+				MaxQueueSize = KeepConnection ? MaxQueueSize : 2,
 				NoDelay = NoDelay,
 				SendTimeout = SendTimeout,
 				SendBufferSize = SendBufferSize,
@@ -807,17 +807,8 @@ namespace NLog.Targets
 			if (!chunks.MoveNext())
 				return first.IsEmpty ? 0 : encoding.GetByteCount(first);
 
-			var encoder = GetThreadEncoder(encoding);
-			int total = first.IsEmpty ? 0 : encoder.GetByteCount(first, flush: false);
-			bool hasMore = true;
-			while (hasMore)
-			{
-				var current = chunks.Current.Span;
-				hasMore = chunks.MoveNext();
-				if (!current.IsEmpty)
-					total += encoder.GetByteCount(current, flush: !hasMore);
-			}
-			return total;
+			// Counting slices does not advance Encoder state across surrogate pairs.
+			return encoding.GetByteCount(sb.ToString());
 		}
 
 		private int EncodeBuilderToSpan(StringBuilder sb, Encoding encoding, Span<byte> destination)
@@ -855,17 +846,22 @@ namespace NLog.Targets
 				return encoding.GetByteCount(charBuf, 0, charLen);
 			}
 
-			var encoder = GetThreadEncoder(encoding);
-			int total = 0;
-			int pos = 0;
-			while (pos < charLen)
+			// UTF-8 is stateless at scalar boundaries. Leave a trailing high surrogate
+			// for the next slice, including when a strict fallback is configured.
+			if (encoding is UTF8Encoding)
 			{
-				int slice = Math.Min(charLen - pos, charBuf.Length);
-				sb.CopyTo(pos, charBuf, 0, slice);
-				pos += slice;
-				total += encoder.GetByteCount(charBuf, 0, slice, pos >= charLen);
+				int total = 0;
+				for (int pos = 0; pos < charLen;)
+				{
+					int n = Math.Min(charLen - pos, charBuf.Length);
+					sb.CopyTo(pos, charBuf, 0, n);
+					if (pos + n < charLen && char.IsHighSurrogate(charBuf[n - 1])) n--;
+					total = checked(total + encoding.GetByteCount(charBuf, 0, n));
+					pos += n;
+				}
+				return total;
 			}
-			return total;
+			return encoding.GetByteCount(sb.ToString());
 		}
 
 		private int EncodeBuilderToArray(StringBuilder sb, Encoding encoding, char[] charBuf, int preCopiedLen, byte[] dest, int destOffset)
@@ -896,16 +892,16 @@ namespace NLog.Targets
 		}
 #endif
 
-		private EncodeStatus TryEncodeIntoSlab(LogEventInfo logEvent, byte[] slab, int slabOffset, out int bytesWritten)
+		private EncodeStatus TryEncodeIntoSlab(LogEventInfo logEvent, byte[] slab, int slabOffset, ref string rendered, out int bytesWritten)
 		{
 			bytesWritten = 0;
 			var encoding = Encoding;
 			int maxAllowed = MaxMessageSize > 0 ? Math.Min(MaxMessageSize, slab.Length) : slab.Length;
 			int remainingInSlab = slab.Length - slabOffset;
 
-			if (TryGetCachedLayoutValue(logEvent, Layout, out var cachedText) && cachedText != null)
+			if (rendered != null || (TryGetCachedLayoutValue(logEvent, Layout, out var cachedText) && (rendered = cachedText?.ToString()) != null))
 			{
-				string str = cachedText.ToString();
+				string str = rendered;
 				int maxPossibleTotal = encoding.GetMaxByteCount(str.Length) + _newLineBytes.Length;
 
 				if (maxPossibleTotal <= maxAllowed && maxPossibleTotal <= remainingInSlab)
@@ -989,11 +985,11 @@ namespace NLog.Targets
 				int reqBytes = GetBuilderByteCount(sb, encoding);
 				int fullTotal = reqBytes + _newLineBytes.Length;
 
-				if (fullTotal > maxAllowed)
-					return EncodeStatus.FallbackSingle;
-
-				if (fullTotal > remainingInSlab)
-					return EncodeStatus.SlabFull;
+				if (fullTotal > maxAllowed || fullTotal > remainingInSlab)
+				{
+					rendered = sb.ToString();
+					return fullTotal > maxAllowed ? EncodeStatus.FallbackSingle : EncodeStatus.SlabFull;
+				}
 
 				if (reqBytes > 0)
 					EncodeBuilderToSpan(sb, encoding, slab.AsSpan(slabOffset, reqBytes));
@@ -1002,11 +998,11 @@ namespace NLog.Targets
 				int reqBytes = GetBuilderByteCount(sb, encoding, charBuf);
 				int fullTotal = reqBytes + _newLineBytes.Length;
 
-				if (fullTotal > maxAllowed)
-					return EncodeStatus.FallbackSingle;
-
-				if (fullTotal > remainingInSlab)
-					return EncodeStatus.SlabFull;
+				if (fullTotal > maxAllowed || fullTotal > remainingInSlab)
+				{
+					rendered = sb.ToString();
+					return fullTotal > maxAllowed ? EncodeStatus.FallbackSingle : EncodeStatus.SlabFull;
+				}
 
 				if (reqBytes > 0)
 					EncodeBuilderToArray(sb, encoding, charBuf, sb.Length <= charBuf.Length ? sb.Length : 0, slab, slabOffset);
@@ -1024,13 +1020,13 @@ namespace NLog.Targets
 			}
 		}
 
-		private byte[] RenderToRentedBuffer(LogEventInfo logEvent, out int totalLength)
+		private byte[] RenderToRentedBuffer(LogEventInfo logEvent, out int totalLength, string rendered)
 		{
 			var encoding = Encoding;
 
-			if (TryGetCachedLayoutValue(logEvent, Layout, out var cachedText) && cachedText != null)
+			if (rendered != null || (TryGetCachedLayoutValue(logEvent, Layout, out var cachedText) && (rendered = cachedText?.ToString()) != null))
 			{
-				string str = cachedText.ToString();
+				string str = rendered;
 				int maxPossibleTotal = encoding.GetMaxByteCount(str.Length) + _newLineBytes.Length;
 
 				if (maxPossibleTotal <= ByteBufferPool.Size1K)
@@ -1170,68 +1166,50 @@ namespace NLog.Targets
 			return continuation == null || ReferenceEquals(continuation, _completedContinuation);
 		}
 
+		public bool NewLinePerSplitChunk { get; set; }
+
 		private int AdjustUtf8ChunkBoundary(byte[] buffer, int pos, int proposedSlice, int totalLimit)
 		{
-			if (!_isUtf8Encoding || pos + proposedSlice >= totalLimit || proposedSlice <= 1)
+			if (!_isUtf8Encoding || pos + proposedSlice >= totalLimit)
 				return proposedSlice;
 
 			// Step back up to 3 bytes if split point falls on a UTF-8 continuation byte (10xxxxxx)
-			int minSlice = Math.Max(1, proposedSlice - 3);
+			int minSlice = Math.Max(0, proposedSlice - 3);
 			int slice = proposedSlice;
 			while (slice > minSlice && (buffer[pos + slice] & 0xC0) == 0x80)
 				slice--;
 
+			if (slice == 0) throw new OverflowException("MaxMessageSize cannot fit one UTF-8 character plus line ending.");
 			return slice;
 		}
 
 		private void SendSplitChunks(TcpNetworkSender sender, byte[] fullBuf, int fullLen, AsyncContinuation finalContinuation)
 		{
+			object completion = IsNoOpContinuation(finalContinuation) ? null : finalContinuation;
+			if (!NewLinePerSplitChunk || _newLineBytes.Length == 0)
+			{
+				sender.SendPooled(fullBuf, 0, fullLen, 1, completion, MaxMessageSize);
+				return;
+			}
 			try
 			{
-				object effectiveFinalCont = IsNoOpContinuation(finalContinuation) ? null : finalContinuation;
-
-				if (NewLine && _newLineBytes.Length > 0 && MaxMessageSize > _newLineBytes.Length)
+				int limit = MaxMessageSize - _newLineBytes.Length;
+				if (limit <= 0) throw new OverflowException("MaxMessageSize must exceed the line ending length.");
+				int end = fullLen - _newLineBytes.Length;
+				int chunks = 0;
+				for (int pos = 0; pos < end; chunks++)
+					pos += AdjustUtf8ChunkBoundary(fullBuf, pos, Math.Min(limit, end - pos), end);
+				var framed = ByteBufferPool.Rent(checked(end + chunks * _newLineBytes.Length));
+				int written = 0;
+				for (int pos = 0; pos < end;)
 				{
-					// Strip trailing newline; append _newLineBytes to every split chunk so newline_delimited stream parsers never merge lines
-					int contentLen = Math.Max(0, fullLen - _newLineBytes.Length);
-					int maxPayloadPerChunk = MaxMessageSize - _newLineBytes.Length;
-					int pos = 0;
-
-					do
-					{
-						int remaining = contentLen - pos;
-						int slice = Math.Min(remaining, maxPayloadPerChunk);
-						slice = AdjustUtf8ChunkBoundary(fullBuf, pos, slice, contentLen);
-
-						int chunkTotal = slice + _newLineBytes.Length;
-						byte[] chunkBuf = ByteBufferPool.Rent(chunkTotal);
-						if (slice > 0)
-							Buffer.BlockCopy(fullBuf, pos, chunkBuf, 0, slice);
-						Buffer.BlockCopy(_newLineBytes, 0, chunkBuf, slice, _newLineBytes.Length);
-
-						pos += slice;
-						bool isLast = pos >= contentLen;
-						sender.SendPooled(chunkBuf, 0, chunkTotal, isLast ? 1 : 0, isLast ? effectiveFinalCont : null);
-					}
-					while (pos < contentLen);
+					int n = AdjustUtf8ChunkBoundary(fullBuf, pos, Math.Min(limit, end - pos), end);
+					Buffer.BlockCopy(fullBuf, pos, framed, written, n);
+					Buffer.BlockCopy(_newLineBytes, 0, framed, written + n, _newLineBytes.Length);
+					pos += n;
+					written += n + _newLineBytes.Length;
 				}
-				else
-				{
-					int pos = 0;
-					while (pos < fullLen)
-					{
-						int remaining = fullLen - pos;
-						int slice = Math.Min(remaining, MaxMessageSize);
-						slice = AdjustUtf8ChunkBoundary(fullBuf, pos, slice, fullLen);
-
-						byte[] chunkBuf = ByteBufferPool.Rent(slice);
-						Buffer.BlockCopy(fullBuf, pos, chunkBuf, 0, slice);
-
-						pos += slice;
-						bool isLast = pos >= fullLen;
-						sender.SendPooled(chunkBuf, 0, slice, isLast ? 1 : 0, isLast ? effectiveFinalCont : null);
-					}
-				}
+				sender.SendPooled(framed, 0, written, 1, completion, MaxMessageSize);
 			}
 			finally
 			{
@@ -1239,7 +1217,7 @@ namespace NLog.Targets
 			}
 		}
 
-		private void WriteSingleToSender(TcpNetworkSender sender, AsyncLogEventInfo logEvent)
+		private void WriteSingleToSender(TcpNetworkSender sender, AsyncLogEventInfo logEvent, string rendered = null)
 		{
 			if (sender == null)
 			{
@@ -1247,7 +1225,7 @@ namespace NLog.Targets
 				return;
 			}
 
-			byte[] buf = RenderToRentedBuffer(logEvent.LogEvent, out int len);
+			byte[] buf = RenderToRentedBuffer(logEvent.LogEvent, out int len, rendered);
 
 			if (len == 0)
 			{
@@ -1352,7 +1330,8 @@ namespace NLog.Targets
 				logEvent.Continuation(ex);
 			};
 
-			WriteSingleToSender(sender, logEvent.LogEvent.WithContinuation(wrappedContinuation));
+			try { WriteSingleToSender(sender, logEvent.LogEvent.WithContinuation(wrappedContinuation)); }
+			catch (Exception ex) { wrappedContinuation(ex); }
 		}
 
 		protected override void Write(AsyncLogEventInfo logEvent)
@@ -1363,8 +1342,12 @@ namespace NLog.Targets
 				return;
 			}
 
-			var sender = ResolveCachedSender(logEvent.LogEvent);
-			WriteSingleToSender(sender, logEvent);
+			if (!_isStaticAddress)
+			{
+				// Keep a dynamic sender alive until this event is admitted; eviction uses this gate.
+				lock (_senderGate) WriteSingleToSender(ResolveCachedSender(logEvent.LogEvent), logEvent);
+			}
+			else WriteSingleToSender(ResolveCachedSender(logEvent.LogEvent), logEvent);
 		}
 
 		protected override void Write(IList<AsyncLogEventInfo> logEvents)
@@ -1373,7 +1356,7 @@ namespace NLog.Targets
 			if (count == 0)
 				return;
 
-			if (!KeepConnection || count == 1)
+			if (!KeepConnection || !_isStaticAddress || count == 1)
 			{
 				for (int i = 0; i < count; i++)
 					Write(logEvents[i]);
@@ -1468,12 +1451,13 @@ namespace NLog.Targets
 						slabEvents = 0;
 					}
 
-					var status = TryEncodeIntoSlab(asyncEvent.LogEvent, slab, slabOffset, out int written);
+					string rendered = null;
+					var status = TryEncodeIntoSlab(asyncEvent.LogEvent, slab, slabOffset, ref rendered, out int written);
 					if (status == EncodeStatus.SlabFull)
 					{
 						FlushCurrentSlab();
 						slab = ByteBufferPool.Rent(ByteBufferPool.Size64K);
-						status = TryEncodeIntoSlab(asyncEvent.LogEvent, slab, 0, out written);
+						status = TryEncodeIntoSlab(asyncEvent.LogEvent, slab, 0, ref rendered, out written);
 					}
 
 					if (status == EncodeStatus.Ok)
@@ -1492,7 +1476,7 @@ namespace NLog.Targets
 					else // FallbackSingle (> 64KB or > MaxMessageSize)
 					{
 						FlushCurrentSlab();
-						WriteSingleToSender(currentSender, asyncEvent);
+						WriteSingleToSender(currentSender, asyncEvent, rendered);
 					}
 				}
 

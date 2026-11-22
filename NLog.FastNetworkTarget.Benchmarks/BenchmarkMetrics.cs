@@ -6,12 +6,14 @@ namespace NLog.FastNetworkTarget.Benchmarks
 	{
 		public string Scenario { get; set; }
 		public int MessageCount { get; set; }
+		public long Received { get; set; }
+		public long Missing => MessageCount - Received;
 		public long TotalBytes { get; set; }
 		public double ElapsedMs { get; set; }
-		public double MessagesPerSec => ElapsedMs > 0 ? (MessageCount / (ElapsedMs / 1000.0)) : 0;
+		public double MessagesPerSec => Verified ? Received * 1000.0 / ElapsedMs : double.NaN;
 		public double MegabytesPerSec => ElapsedMs > 0 ? ((TotalBytes / (1024.0 * 1024.0)) / (ElapsedMs / 1000.0)) : 0;
 		public double CpuTimeMs { get; set; }
-		public double CpuMsPer100k => MessageCount > 0 ? (CpuTimeMs / MessageCount * 100_000.0) : 0;
+		public double CpuMsPer100k => Verified ? CpuTimeMs / Received * 100_000.0 : double.NaN;
 		public int Gen0 { get; set; }
 		public int Gen1 { get; set; }
 		public int Gen2 { get; set; }
@@ -26,7 +28,7 @@ namespace NLog.FastNetworkTarget.Benchmarks
 
 		public string ToMarkdownRow()
 		{
-			return $"| `{Scenario}` | {MessagesPerSec:N0} | {MegabytesPerSec:N1} | {CpuMsPer100k:N1} | {Gen0} / {Gen1} / {Gen2} | {BytesPerMsg:N0} | {(Verified ? "PASS" : "FAIL")} |";
+			return $"| `{Scenario}` | {MessageCount}/{Received}/{Missing} | {MessagesPerSec:N0} | {MegabytesPerSec:N1} | {CpuMsPer100k:N1} | {Gen0} / {Gen1} / {Gen2} | {BytesPerMsg:N0} | {(Verified ? "PASS" : "FAIL")} |";
 		}
 	}
 }

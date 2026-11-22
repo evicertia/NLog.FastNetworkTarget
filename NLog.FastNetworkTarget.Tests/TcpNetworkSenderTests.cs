@@ -427,12 +427,16 @@ namespace NLog.FastNetworkTarget
 				Assert.That(sender.DroppedMessages, Is.GreaterThanOrEqualTo(24));
 				Assert.That(sender.SendFailures, Is.EqualTo(0));
 
-				sendGate.Set();
 				var flushed = new ManualResetEvent(false);
 				sender.FlushAsync(ex => flushed.Set());
+				Assert.That(flushed.WaitOne(0), Is.False, "A full ring must not discard a flush barrier");
+				using var closed = new ManualResetEvent(false);
+				sender.Close(ex => closed.Set());
+				Assert.That(closed.WaitOne(0), Is.False);
+				sendGate.Set();
 				Assert.That(flushed.WaitOne(3000), Is.True);
-
-				sender.Close(ex => { });
+				Assert.That(closed.WaitOne(3000), Is.True);
+				Assert.That(completedContinuations, Is.EqualTo(40));
 			}
 		}
 

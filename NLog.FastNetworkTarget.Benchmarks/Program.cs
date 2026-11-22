@@ -100,6 +100,8 @@ namespace NLog.FastNetworkTarget.Benchmarks
 					using (var receiver = new MockTcpReceiver())
 					{
 						var result = scenario.Runner(receiver);
+						result.Received = receiver.TotalLinesReceived;
+						result.Verified &= result.Missing == 0;
 						runResults.Add(result);
 						Console.Write($"[{iter}: {result.MessagesPerSec:N0} msg/s] ");
 					}
@@ -109,6 +111,11 @@ namespace NLog.FastNetworkTarget.Benchmarks
 				// Pick median by MessagesPerSec
 				var median = runResults.OrderBy(r => r.MessagesPerSec).ElementAt(runResults.Count / 2);
 				median.Scenario = scenario.Name;
+				foreach (var failed in runResults.Where(r => !r.Verified && r != median))
+				{
+					failed.Scenario = scenario.Name + " (failed iteration)";
+					medianResults.Add(failed);
+				}
 				medianResults.Add(median);
 
 				Console.WriteLine(median.ToString());
@@ -118,12 +125,14 @@ namespace NLog.FastNetworkTarget.Benchmarks
 
 			if (!string.IsNullOrEmpty(mdPath))
 			{
-				string title = mdPath.Contains("baseline") ? "Baseline Performance Report (v1)" : "v2 Performance Report";
+				string title = Path.GetFileNameWithoutExtension(mdPath);
 				WriteMarkdownReport(mdPath, medianResults, title);
 				Console.WriteLine($"\nMarkdown report saved to: {mdPath}");
 			}
 
-			return 0;
+			// Historical v1 starts foreground sender threads which self-join on close.
+			Environment.Exit(medianResults.All(r => r.Verified) ? 0 : 1);
+			return Environment.ExitCode;
 		}
 
 		private static void PrintEnvironmentInfo()
@@ -226,15 +235,9 @@ namespace NLog.FastNetworkTarget.Benchmarks
 				GlobalDiagnosticsContext.Set("RunningTime", "0001.2s");
 				MappedDiagnosticsContext.Set("CorrelationId", "corr-99281-xyz");
 
-				var barrier = new Barrier(threads + 1);
+				var ready = new CountdownEvent(threads);
+				var start = new ManualResetEventSlim();
 				var process = Process.GetCurrentProcess();
-
-				long startAlloc = GetAllocatedBytes();
-				int g0 = GC.CollectionCount(0);
-				int g1 = GC.CollectionCount(1);
-				int g2 = GC.CollectionCount(2);
-				var startCpu = process.TotalProcessorTime;
-				var sw = new Stopwatch();
 
 				var workerThreads = new Thread[threads];
 				for (int t = 0; t < threads; t++)
@@ -246,7 +249,8 @@ namespace NLog.FastNetworkTarget.Benchmarks
 						for (int i = 0; i < messagesPerThread; i++)
 							logEvents[i] = CreateLogEvent(threadIdx * messagesPerThread + i);
 
-						barrier.SignalAndWait();
+						ready.Signal();
+						start.Wait();
 
 						for (int i = 0; i < messagesPerThread; i++)
 						{
@@ -260,8 +264,12 @@ namespace NLog.FastNetworkTarget.Benchmarks
 					workerThreads[t].Start();
 				}
 
-				barrier.SignalAndWait();
-				sw.Start();
+				ready.Wait();
+				long startAlloc = GetAllocatedBytes();
+				int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+				var startCpu = process.TotalProcessorTime;
+				var sw = Stopwatch.StartNew();
+				start.Set();
 
 				for (int t = 0; t < threads; t++)
 					workerThreads[t].Join();
@@ -418,8 +426,8 @@ namespace NLog.FastNetworkTarget.Benchmarks
 				workerThreads[t].Start();
 			}
 
-			barrier.SignalAndWait();
 			sw.Start();
+			barrier.SignalAndWait();
 
 			for (int t = 0; t < threads; t++)
 				workerThreads[t].Join();
@@ -540,12 +548,13 @@ namespace NLog.FastNetworkTarget.Benchmarks
 			sb.AppendLine($"- **Processors**: `{Environment.ProcessorCount} logical cores`");
 			sb.AppendLine($"- **NLog Version**: `{typeof(LogEventInfo).Assembly.GetName().Version}`");
 			sb.AppendLine();
-			sb.AppendLine("| Scenario | Throughput (msg/s) | Bandwidth (MB/s) | CPU (ms/100k) | GC (0/1/2) | Alloc (B/msg) | Verified |");
-			sb.AppendLine("| :--- | :---: | :---: | :---: | :---: | :---: | :---: |");
+			sb.AppendLine("| Scenario | Attempted/received/missing | Delivered/s | MiB/s | CPU ms/100k delivered | GC (0/1/2) | B/msg* | Verified |");
+			sb.AppendLine("| :--- | ---: | ---: | ---: | ---: | :---: | ---: | :---: |");
 
 			foreach (var r in results)
 				sb.AppendLine(r.ToMarkdownRow());
 
+			sb.AppendLine("\n* Mono uses live heap delta when cumulative allocation accounting is unavailable; not comparable to .NET allocation counts.");
 			File.WriteAllText(path, sb.ToString());
 		}
 	}

@@ -18,22 +18,7 @@ A high-throughput, low-CPU network target for NLog designed for massive-volume T
 
 ## Performance: v1 vs v2 Benchmark Summary
 
-Tested with Herma's full `JsonLayout` payloads across 12 logical cores (Apple Silicon):
-
-### .NET 8
-- **End-to-End Pipeline (`HermaE2E`)**: **549,868 msg/s** (vs 4,948 msg/s in v1 where queue overflow dropped messages — **111x throughput increase**, **0 Gen2 GCs**)
-- **Single Thread Direct**: **389,412 msg/s** (vs 110,279 msg/s — **3.5x throughput increase**, **71% CPU reduction**)
-- **Concurrent 8 Threads**: **421,012 msg/s** (vs 229,111 msg/s — **1.8x throughput increase**, **45% CPU reduction**)
-- **Concurrent 32 Threads**: **373,278 msg/s** (vs 236,488 msg/s — **1.6x throughput increase**, **30% CPU reduction**)
-- **Direct Batching (`Batch1000`)**: **375,705 msg/s** (vs 262,881 msg/s — **53% CPU reduction**, **51% fewer allocations**)
-- **32 KB Large Payloads**: **62,506 msg/s** (`1.95 GB/s`), memory allocations cut by **80%** (from 98 KB/msg down to 19 KB/msg, **29% CPU reduction**).
-
-### Mono 6.12 (.NET Framework 4.6.2+)
-- **Concurrent 8 Threads**: **416,052 msg/s** (vs 61,994 msg/s — **6.7x throughput increase**, **48% CPU reduction**)
-- **Concurrent 16 Threads**: **468,586 msg/s** (vs 62,023 msg/s — **7.6x throughput increase**, **49% CPU reduction**)
-- **Concurrent 32 Threads**: **466,534 msg/s** (vs 60,745 msg/s — **7.7x throughput increase**, **49% CPU reduction**)
-- **End-to-End Pipeline (`HermaE2E`)**: **377,472 msg/s** (vs 4,900 msg/s — **77x throughput increase**)
-- **32 KB Large Payloads**: **30,090 msg/s** (`940 MB/s`, **40% CPU reduction**), Gen2 pause-inducing GC collections cut by **93%** (from 14 down to 1).
+In a matched 16-producer Herma-style loopback benchmark, all revisions delivered 50,000 of 50,000 records. Median throughput increased from 322k to 688k records/s on .NET 8 and from 157k to 375k on Mono. Process CPU per delivered record fell by 42% and 23% respectively versus v1.
 
 Full benchmark details and methodology are documented in [`benchmarks/results/COMPARISON-v1-vs-v2.md`](benchmarks/results/COMPARISON-v1-vs-v2.md).
 
@@ -52,7 +37,7 @@ Full benchmark details and methodology are documented in [`benchmarks/results/CO
 4. **Zero-LOH Byte Buffer Pooling**:
    - `ByteBufferPool` provides TLS-cached, non-blocking bucketed buffers (`1 KB`, `4 KB`, `16 KB`, `32 KB`, `64 KB` + `ArrayPool` / shared large buckets) eliminating recurring Large Object Heap (`>= 85 KB`) Gen2 GC pauses.
 5. **Newline-Safe & UTF-8-Safe `Split`**:
-   - Defaults `maxMessageSize` to `262144` (256 KB). When an oversized message exceeds `maxMessageSize` with `onOverflow="Split"` and `newLine="true"`, each chunk is split cleanly at UTF-8 codepoint boundaries and terminated with `lineEnding` so downstream `newline_delimited` parsers (Vector / Logstash) never merge split chunks with subsequent JSON log lines.
+   - An oversized record is admitted or discarded as one event. By default, splitting limits socket writes without altering the byte stream: a JSON record still has one final delimiter. For plain-text fragment consumers only, `newLinePerSplitChunk="true"` inserts delimiters between fragments; these are not standalone JSON documents.
 6. **Configurable Queue Overflow & Non-Blocking Safety**:
    - Configurable `onQueueOverflow="Discard"` (default) or `Block` so high-volume bursts never wedge application threads.
 7. **Socket & TCP Hardening**:
@@ -99,7 +84,8 @@ Full benchmark details and methodology are documented in [`benchmarks/results/CO
 | Attribute | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `address` | `Layout` | *(Required)* | Network endpoint (`tcp://host:port`, `tcp4://host:port`, `tcp6://host:port`). |
-| `newLine` | `bool` | `false` | Append line ending after each message (and after each `Split` chunk). |
+| `newLine` | `bool` | `false` | Append line ending after each message. |
+| `newLinePerSplitChunk` | `bool` | `false` | With `newLine`, delimit text fragments individually instead of preserving one record. |
 | `lineEnding` | `LineEndingMode` | `CRLF` | `LF`, `CRLF`, `CR`, or `Null`. |
 | `maxMessageSize` | `int` | `262144` (256 KB) | Maximum message size in bytes before triggering `onOverflow`. |
 | `onOverflow` | `enum` | `Split` | `Split` (UTF-8 & newline-safe), `Discard`, or `Error`. |

@@ -439,7 +439,7 @@ namespace NLog.FastNetworkTarget
 		{
 			using (var receiverA = new TestTcpReceiver(storeLines: true))
 			using (var receiverB = new TestTcpReceiver(storeLines: true))
-			using (var ctx = CreateTarget("${event-properties:endpoint}"))
+			using (var ctx = CreateTarget("${event-properties:endpoint}", t => t.ConnectionCacheSize = 1))
 			{
 				var target = ctx.Target;
 				var batch = new AsyncLogEventInfo[20];
@@ -461,17 +461,8 @@ namespace NLog.FastNetworkTarget
 				Assert.That(receiverA.WaitForMessages(10, TimeSpan.FromSeconds(3)), Is.True);
 				Assert.That(receiverB.WaitForMessages(10, TimeSpan.FromSeconds(3)), Is.True);
 
-				for (int i = 0; i < 20; i += 2)
-				{
-					Assert.That(receiverA.ReceivedLines.TryDequeue(out var lineA), Is.True);
-					Assert.That(lineA, Is.EqualTo($"A_{i}"));
-				}
-
-				for (int i = 1; i < 20; i += 2)
-				{
-					Assert.That(receiverB.ReceivedLines.TryDequeue(out var lineB), Is.True);
-					Assert.That(lineB, Is.EqualTo($"B_{i}"));
-				}
+				Assert.That(receiverA.ReceivedLines, Is.EquivalentTo(Enumerable.Range(0, 10).Select(i => $"A_{2*i}")));
+				Assert.That(receiverB.ReceivedLines, Is.EquivalentTo(Enumerable.Range(0, 10).Select(i => $"B_{2*i+1}")));
 			}
 		}
 
@@ -518,6 +509,7 @@ namespace NLog.FastNetworkTarget
 			using (var ctx = CreateTarget(receiver.Address, t =>
 			{
 				t.MaxMessageSize = 25; // Small enough to force multiple chunks on 3-byte '€' chars + '\n'
+				t.NewLinePerSplitChunk = true;
 				t.OnOverflow = NetworkTargetOverflowAction.Split;
 				t.NewLine = true;
 				t.LineEnding = LineEndingMode.LF;
@@ -556,6 +548,36 @@ namespace NLog.FastNetworkTarget
 				Assert.That(reconstructed, Is.EqualTo(euroMessage));
 				Assert.That(target.SentMessages, Is.EqualTo(2), "SentMessages should count 2 logical events despite chunking");
 			}
+		}
+
+		[Test]
+		public void Split_PreservesOneUnicodeJsonRecord()
+		{
+			using var receiver = new TestTcpReceiver(storeLines: true);
+			using var ctx = CreateTarget(receiver.Address, t => t.MaxMessageSize = 100);
+			var json = "\"" + new string('x', 4094) + "😀\"";
+			ctx.Factory.GetLogger("unicode").Info(json);
+			ctx.Factory.Flush(TimeSpan.FromSeconds(3));
+			Assert.That(receiver.WaitForBytes(Encoding.UTF8.GetByteCount(json) + 1, TimeSpan.FromSeconds(3)), Is.True);
+			Assert.That(receiver.ReceivedLines.ToArray(), Is.EqualTo(new[] { json }));
+		}
+
+		[Test]
+		public void TransientEncodingFailure_ReleasesTheOnlyConnection()
+		{
+			using var receiver = new TestTcpReceiver(storeLines: true);
+			using var ctx = CreateTarget(receiver.Address, t => {
+				t.KeepConnection = false;
+				t.MaxConnections = 1;
+				t.OnConnectionOverflow = NetworkTargetConnectionsOverflowAction.Block;
+				t.Encoding = new UTF8Encoding(false, true);
+			});
+			Exception error = null;
+			ctx.Target.WriteAsyncLogEvent(new LogEventInfo(LogLevel.Info, "test", "\ud800").WithContinuation(ex => error = ex));
+			Assert.That(error, Is.TypeOf<EncoderFallbackException>());
+			Assert.That(ctx.Target.ConnectionCount, Is.Zero);
+			ctx.Factory.GetLogger("test").Info("next");
+			Assert.That(receiver.WaitForMessages(1, TimeSpan.FromSeconds(3)), Is.True);
 		}
 
 		[Test]
