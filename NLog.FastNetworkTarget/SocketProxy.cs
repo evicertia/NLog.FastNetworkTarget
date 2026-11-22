@@ -52,7 +52,8 @@ namespace NLog.Internal.NetworkSenders
 
 		internal SocketProxy(AddressFamily addressFamily, SocketType socketType, ProtocolType protocolType)
 		{
-			_socket = new Socket(addressFamily, socketType, protocolType);
+			var af = addressFamily == AddressFamily.Unspecified ? AddressFamily.InterNetwork : addressFamily;
+			_socket = new Socket(af, socketType, protocolType);
 		}
 
 		#endregion

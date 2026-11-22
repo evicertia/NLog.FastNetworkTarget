@@ -71,7 +71,21 @@ namespace NLog.Internal
 
 		private static RuntimeOS GetCurrentRuntimeOS()
 		{
+#if NETSTANDARD2_0_OR_GREATER || NET8_0_OR_GREATER
+			if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
+				return RuntimeOS.MacOSX;
+
+			if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Linux))
+				return RuntimeOS.Linux;
+
+			if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.Windows))
+				return RuntimeOS.WindowsNT;
+#endif
+
 			var platformID = Environment.OSVersion.Platform;
+
+			if (platformID == PlatformID.MacOSX || ((int)platformID == 4 && System.IO.Directory.Exists("/System/Library")))
+				return RuntimeOS.MacOSX;
 
 			if ((int)platformID == 4 || (int)platformID == 128)
 				return RuntimeOS.Linux;

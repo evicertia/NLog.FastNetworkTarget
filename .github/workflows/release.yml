@@ -1,0 +1,161 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-master
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      ASSEMBLY_VERSION: 2.0.0.0
+      INFORMATIONAL_VERSION: "${{ github.ref_name }}:${{ github.sha }}"
+      PACKAGE_RELEASE_NOTES: "See changes for this revision at: https://github.com/evicertia/NLog.FastNetworkTarget/commit/${{ github.sha }}"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Set package version
+        shell: pwsh
+        run: |
+          $build = [int]$env:GITHUB_RUN_NUMBER - 1
+          "PACKAGE_VERSION=2.0.$build" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "FILE_VERSION=2.0.$build.0" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore NLog.FastNetworkTarget.sln -p:NuGetAudit=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $msbuildArgs = @(
+            "NLog.FastNetworkTarget.sln",
+            "/m",
+            "/p:Configuration=Release",
+            "/p:Platform=Any CPU",
+            "/p:Version=$env:PACKAGE_VERSION",
+            "/p:PackageVersion=$env:PACKAGE_VERSION",
+            "/p:AssemblyVersion=$env:ASSEMBLY_VERSION",
+            "/p:FileVersion=$env:FILE_VERSION",
+            "/p:InformationalVersion=$env:INFORMATIONAL_VERSION",
+            "/p:RepositoryCommit=$env:GITHUB_SHA",
+            "/p:PackageReleaseNotes=$env:PACKAGE_RELEASE_NOTES",
+            "/p:NuGetAudit=false",
+            "/verbosity:minimal"
+          )
+          msbuild @msbuildArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Test
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path TestResults -Force | Out-Null
+          dotnet test NLog.FastNetworkTarget.Tests/NLog.FastNetworkTarget.Tests.csproj --configuration Release --no-build --framework net8.0 --logger "trx;LogFileName=net8.0.trx" --results-directory TestResults
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet test NLog.FastNetworkTarget.Tests/NLog.FastNetworkTarget.Tests.csproj --configuration Release --no-build --framework net462 --logger "trx;LogFileName=net462.trx" --results-directory TestResults
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          $packArgs = @(
+            "pack",
+            "NLog.FastNetworkTarget/NLog.FastNetworkTarget.csproj",
+            "--configuration", "Release",
+            "--no-build",
+            "--include-symbols",
+            "-p:SymbolPackageFormat=snupkg",
+            "--output", "artifacts",
+            "-p:Version=$env:PACKAGE_VERSION",
+            "-p:PackageVersion=$env:PACKAGE_VERSION",
+            "-p:AssemblyVersion=$env:ASSEMBLY_VERSION",
+            "-p:FileVersion=$env:FILE_VERSION",
+            "-p:InformationalVersion=$env:INFORMATIONAL_VERSION",
+            "-p:RepositoryCommit=$env:GITHUB_SHA",
+            "-p:PackageReleaseNotes=$env:PACKAGE_RELEASE_NOTES",
+            "-p:NuGetAudit=false"
+          )
+          dotnet @packArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/**/*.trx
+          if-no-files-found: ignore
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    if: github.ref == 'refs/heads/master'
+    runs-on: windows-2022
+    timeout-minutes: 15
+    environment: nuget
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: packages
+          path: artifacts
+
+      - name: NuGet login (OIDC to temporary API key)
+        id: login
+        if: "${{ vars.NUGET_USER != '' }}"
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Publish packages
+        shell: pwsh
+        env:
+          NUGET_API_KEY: ${{ steps.login.outputs.NUGET_API_KEY || secrets.NUGET_API_KEY }}
+        run: |
+          Get-ChildItem artifacts -Filter *.nupkg | ForEach-Object {
+            dotnet nuget push $_.FullName --source https://api.nuget.org/v3/index.json --api-key $env:NUGET_API_KEY --skip-duplicate
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
