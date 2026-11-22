@@ -195,33 +195,38 @@ namespace NLog.Internal.NetworkSenders
 			base.DoInitialize();
 		}
 
-		internal void SendPooled(byte[] pooledBuffer, int offset, int length, int eventCount, object continuation, int chunkSize = 0)
+		internal bool TrySendPooled(byte[] pooledBuffer, int offset, int length, int eventCount, object continuation, int chunkSize = 0)
 		{
 			if (_isClosed)
-			{
-				ByteBufferPool.Return(pooledBuffer);
-				InvokeContinuation(continuation, new InvalidOperationException("NetworkSender is closed."));
-				return;
-			}
+				return false;
 
-			EnqueueItem(pooledBuffer, offset, length, eventCount, continuation, FLAG_POOLED, chunkSize);
+			return EnqueueItem(pooledBuffer, offset, length, eventCount, continuation, FLAG_POOLED, chunkSize);
 		}
 
 		protected override void DoSend(byte[] bytes, int offset, int length, AsyncContinuation asyncContinuation)
 		{
-			if (_isClosed)
+			if (_isClosed || !EnqueueItem(bytes, offset, length, 1, asyncContinuation, FLAG_DATA))
 			{
 				asyncContinuation?.Invoke(new InvalidOperationException("NetworkSender is closed."));
-				return;
 			}
-
-			EnqueueItem(bytes, offset, length, 1, asyncContinuation, FLAG_DATA);
 		}
 
 		protected override void DoFlush(AsyncContinuation continuation)
 		{
+			if (_closedCompleted.IsSet || _thread == null)
+			{
+				continuation?.Invoke(null);
+				return;
+			}
+
 			lock (_lock)
 			{
+				if (_closedCompleted.IsSet)
+				{
+					continuation?.Invoke(null);
+					return;
+				}
+
 				int position = Head;
 				Volatile.Write(ref _flushPending, 1);
 				Thread.MemoryBarrier();
@@ -323,12 +328,14 @@ namespace NLog.Internal.NetworkSenders
 
 		#region Enqueue Logic
 
-		private void EnqueueItem(byte[] bytes, int offset, int length, int eventCount, object continuation, byte flags, int chunkSize = 0)
+		private bool EnqueueItem(byte[] bytes, int offset, int length, int eventCount, object continuation, byte flags, int chunkSize = 0)
 		{
 			while (true)
 			{
 				long observed = Volatile.Read(ref _admission);
-				if ((observed & CLOSED) != 0) break;
+				if ((observed & CLOSED) != 0)
+					return false;
+
 				int head = unchecked((int)observed);
 				int tail = Volatile.Read(ref _dequeuePos);
 
@@ -341,7 +348,7 @@ namespace NLog.Internal.NetworkSenders
 
 						ReturnIfPooled(bytes, flags);
 						InvokeContinuation(continuation, null);
-						return;
+						return true;
 					}
 
 					// Block until space becomes available or sender closes
@@ -374,13 +381,9 @@ namespace NLog.Internal.NetworkSenders
 						TrySetEvent(_dataAvailable);
 					}
 
-					return;
+					return true;
 				}
 			}
-
-			// Sender closed concurrently
-			ReturnIfPooled(bytes, flags);
-			InvokeContinuation(continuation, new InvalidOperationException("NetworkSender is closed."));
 		}
 
 		#endregion
@@ -677,10 +680,18 @@ namespace NLog.Internal.NetworkSenders
 								else
 								{
 									// Multiple items: coalesce into sendBuffer and return pooled buffers before syscall
-									sendBuffer ??= new byte[maxBatchBytes];
-									batchContinuations ??= new object[maxBatchCount];
+									if (sendBuffer == null)
+									{
+#if NET8_0_OR_GREATER
+										sendBuffer = GC.AllocateUninitializedArray<byte>(maxBatchBytes, pinned: true);
+#else
+										sendBuffer = new byte[maxBatchBytes];
+#endif
+									}
+
 									int writeOffset = 0;
 									long batchEvents = 0;
+									bool hasContinuations = false;
 
 									for (int i = 0; i < batchCount; i++)
 									{
@@ -690,9 +701,15 @@ namespace NLog.Internal.NetworkSenders
 										var off = _ring[idx].Offset;
 										var len = _ring[idx].Length;
 										var flags = _ring[idx].Flags;
+										var cont = _ring[idx].Continuation;
 
 										batchEvents += _ring[idx].EventCount;
-										batchContinuations[i] = _ring[idx].Continuation;
+										if (cont != null)
+										{
+											batchContinuations ??= new object[maxBatchCount];
+											batchContinuations[i] = cont;
+											hasContinuations = true;
+										}
 
 										if (buf != null && len > 0)
 										{
@@ -725,18 +742,25 @@ namespace NLog.Internal.NetworkSenders
 											Volatile.Write(ref _sentBatches, _sentBatches + 1);
 										}
 
-										for (int i = 0; i < batchCount; i++)
-											InvokeContinuation(batchContinuations[i], null);
+										if (hasContinuations)
+										{
+											for (int i = 0; i < batchCount; i++)
+												InvokeContinuation(batchContinuations[i], null);
+										}
 									}
 									catch (Exception sendEx)
 									{
-										for (int i = 0; i < batchCount; i++)
-											InvokeContinuation(batchContinuations[i], sendEx);
+										if (hasContinuations)
+										{
+											for (int i = 0; i < batchCount; i++)
+												InvokeContinuation(batchContinuations[i], sendEx);
+										}
 										throw;
 									}
 									finally
 									{
-										Array.Clear(batchContinuations, 0, batchCount);
+										if (hasContinuations)
+											Array.Clear(batchContinuations, 0, batchCount);
 									}
 								}
 							}
@@ -810,12 +834,25 @@ namespace NLog.Internal.NetworkSenders
 			finally
 			{
 				CloseSocket();
+				CompleteThrough(Head);
 				AsyncContinuation closed;
+				System.Collections.Generic.List<FlushRequest> remainingFlushes = null;
 				lock (_lock)
 				{
 					closed = _onClosed;
 					_onClosed = null;
 					_closedCompleted.Set();
+					if (_flushes.Count > 0)
+					{
+						remainingFlushes = new System.Collections.Generic.List<FlushRequest>(_flushes);
+						_flushes.Clear();
+					}
+					Volatile.Write(ref _flushPending, 0);
+				}
+				if (remainingFlushes != null)
+				{
+					for (int i = 0; i < remainingFlushes.Count; i++)
+						remainingFlushes[i].Callback?.Invoke(null);
 				}
 				closed?.Invoke(null);
 				try { _dataAvailable.Dispose(); } catch { }

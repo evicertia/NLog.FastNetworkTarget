@@ -430,14 +430,26 @@ namespace NLog.Targets
 				if (simple.IsFixedText)
 					return true;
 
-				if (simple.Renderers != null &&
-					simple.Renderers.Count == 1 &&
-					simple.Renderers[0] is CachedLayoutRendererWrapper cached &&
-					cached.Cached &&
-					cached.ClearCache == CachedLayoutRendererWrapper.ClearCacheOption.None &&
-					cached.CacheKey == null &&
-					cached.CachedSeconds == 0)
+				if (simple.Renderers != null && simple.Renderers.Count > 0)
 				{
+					for (int i = 0; i < simple.Renderers.Count; i++)
+					{
+						var r = simple.Renderers[i];
+						if (r is NLog.LayoutRenderers.LiteralLayoutRenderer)
+							continue;
+
+						if (r is CachedLayoutRendererWrapper cached &&
+							cached.Cached &&
+							cached.ClearCache == CachedLayoutRendererWrapper.ClearCacheOption.None &&
+							cached.CacheKey == null &&
+							cached.CachedSeconds == 0)
+						{
+							continue;
+						}
+
+						return false;
+					}
+
 					return true;
 				}
 			}
@@ -807,7 +819,63 @@ namespace NLog.Targets
 			if (!chunks.MoveNext())
 				return first.IsEmpty ? 0 : encoding.GetByteCount(first);
 
-			// Counting slices does not advance Encoder state across surrogate pairs.
+			if (encoding is UTF8Encoding)
+			{
+				int total = 0;
+				char pendingHighSurrogate = '\0';
+				Span<char> pair = stackalloc char[2];
+				var current = first;
+				bool hasMore = true;
+
+				while (true)
+				{
+					if (!current.IsEmpty)
+					{
+						if (pendingHighSurrogate != '\0')
+						{
+							pair[0] = pendingHighSurrogate;
+							pair[1] = current[0];
+							if (char.IsLowSurrogate(pair[1]))
+							{
+								total = checked(total + encoding.GetByteCount(pair));
+								current = current.Slice(1);
+							}
+							else
+							{
+								total = checked(total + encoding.GetByteCount(pair.Slice(0, 1)));
+							}
+							pendingHighSurrogate = '\0';
+						}
+
+						if (!current.IsEmpty)
+						{
+							if (hasMore && char.IsHighSurrogate(current[current.Length - 1]))
+							{
+								pendingHighSurrogate = current[current.Length - 1];
+								current = current.Slice(0, current.Length - 1);
+							}
+
+							if (!current.IsEmpty)
+								total = checked(total + encoding.GetByteCount(current));
+						}
+					}
+
+					if (!hasMore)
+						break;
+
+					current = chunks.Current.Span;
+					hasMore = chunks.MoveNext();
+				}
+
+				if (pendingHighSurrogate != '\0')
+				{
+					pair[0] = pendingHighSurrogate;
+					total = checked(total + encoding.GetByteCount(pair.Slice(0, 1)));
+				}
+
+				return total;
+			}
+
 			return encoding.GetByteCount(sb.ToString());
 		}
 
@@ -1183,12 +1251,48 @@ namespace NLog.Targets
 			return slice;
 		}
 
+		private static void InvokePooledContinuation(object continuation, Exception ex)
+		{
+			if (continuation == null)
+				return;
+
+			if (continuation is AsyncContinuation single)
+			{
+				single(ex);
+				return;
+			}
+
+			if (continuation is AsyncContinuation[] array)
+			{
+				for (int i = 0; i < array.Length; i++)
+					array[i]?.Invoke(ex);
+			}
+		}
+
+		private void DispatchPooledToSender(TcpNetworkSender sender, byte[] pooledBuffer, int offset, int length, int eventCount, object continuation, int chunkSize = 0)
+		{
+			var current = sender;
+			for (int attempt = 0; attempt < 3 && current != null; attempt++)
+			{
+				if (current.TrySendPooled(pooledBuffer, offset, length, eventCount, continuation, chunkSize))
+					return;
+
+				if (!KeepConnection || !_isOpen || _isStaticAddress)
+					break;
+
+				current = GetOrCreateCachedSender(current.Address);
+			}
+
+			ByteBufferPool.Return(pooledBuffer);
+			InvokePooledContinuation(continuation, new InvalidOperationException("NetworkSender is closed."));
+		}
+
 		private void SendSplitChunks(TcpNetworkSender sender, byte[] fullBuf, int fullLen, AsyncContinuation finalContinuation)
 		{
 			object completion = IsNoOpContinuation(finalContinuation) ? null : finalContinuation;
 			if (!NewLinePerSplitChunk || _newLineBytes.Length == 0)
 			{
-				sender.SendPooled(fullBuf, 0, fullLen, 1, completion, MaxMessageSize);
+				DispatchPooledToSender(sender, fullBuf, 0, fullLen, 1, completion, MaxMessageSize);
 				return;
 			}
 			try
@@ -1209,7 +1313,7 @@ namespace NLog.Targets
 					pos += n;
 					written += n + _newLineBytes.Length;
 				}
-				sender.SendPooled(framed, 0, written, 1, completion, MaxMessageSize);
+				DispatchPooledToSender(sender, framed, 0, written, 1, completion, MaxMessageSize);
 			}
 			finally
 			{
@@ -1256,7 +1360,7 @@ namespace NLog.Targets
 			}
 
 			object cont = IsNoOpContinuation(logEvent.Continuation) ? null : logEvent.Continuation;
-			sender.SendPooled(buf, 0, len, 1, cont);
+			DispatchPooledToSender(sender, buf, 0, len, 1, cont);
 		}
 
 		private void WriteTransientConnection(AsyncLogEventInfo logEvent)
@@ -1342,12 +1446,7 @@ namespace NLog.Targets
 				return;
 			}
 
-			if (!_isStaticAddress)
-			{
-				// Keep a dynamic sender alive until this event is admitted; eviction uses this gate.
-				lock (_senderGate) WriteSingleToSender(ResolveCachedSender(logEvent.LogEvent), logEvent);
-			}
-			else WriteSingleToSender(ResolveCachedSender(logEvent.LogEvent), logEvent);
+			WriteSingleToSender(ResolveCachedSender(logEvent.LogEvent), logEvent);
 		}
 
 		protected override void Write(IList<AsyncLogEventInfo> logEvents)
@@ -1356,7 +1455,7 @@ namespace NLog.Targets
 			if (count == 0)
 				return;
 
-			if (!KeepConnection || !_isStaticAddress || count == 1)
+			if (!KeepConnection || count == 1)
 			{
 				for (int i = 0; i < count; i++)
 					Write(logEvents[i]);
@@ -1372,7 +1471,7 @@ namespace NLog.Targets
 			AsyncContinuation singleCont = null;
 			List<AsyncContinuation> multiConts = null;
 
-			void FlushCurrentSlab()
+			void FlushCurrentSlab(bool retainSlabOnSmallPayload = false)
 			{
 				if (slabOffset > 0 && currentSender != null)
 				{
@@ -1383,12 +1482,23 @@ namespace NLog.Targets
 					multiConts?.Clear();
 					singleCont = null;
 
-					currentSender.SendPooled(slab, 0, slabOffset, slabEvents, contPayload);
-					slab = null;
-					slabOffset = 0;
-					slabEvents = 0;
+					if (retainSlabOnSmallPayload && slabOffset <= ByteBufferPool.Size4K)
+					{
+						byte[] compact = ByteBufferPool.Rent(slabOffset);
+						Buffer.BlockCopy(slab, 0, compact, 0, slabOffset);
+						DispatchPooledToSender(currentSender, compact, 0, slabOffset, slabEvents, contPayload);
+						slabOffset = 0;
+						slabEvents = 0;
+					}
+					else
+					{
+						DispatchPooledToSender(currentSender, slab, 0, slabOffset, slabEvents, contPayload);
+						slab = null;
+						slabOffset = 0;
+						slabEvents = 0;
+					}
 				}
-				else if (slab != null)
+				else if (slab != null && !retainSlabOnSmallPayload)
 				{
 					ByteBufferPool.Return(slab);
 					slab = null;
@@ -1428,19 +1538,48 @@ namespace NLog.Targets
 				for (int i = 0; i < count; i++)
 				{
 					var asyncEvent = logEvents[i];
+					TcpNetworkSender eventSender = fixedSender;
 
-					TcpNetworkSender eventSender = fixedSender ?? ResolveCachedSender(asyncEvent.LogEvent);
 					if (eventSender == null)
 					{
-						asyncEvent.Continuation(null);
-						continue;
+						var address = RenderLogEvent(Address, asyncEvent.LogEvent);
+						if (string.IsNullOrWhiteSpace(address))
+						{
+							asyncEvent.Continuation(null);
+							continue;
+						}
+
+						if (currentSender != null && string.Equals(currentSender.Address, address, StringComparison.OrdinalIgnoreCase))
+						{
+							eventSender = currentSender;
+						}
+						else
+						{
+							// Flush current sender's slab BEFORE resolving the new address (which may evict currentSender when ConnectionCacheSize is small)
+							if (currentSender != null)
+							{
+								FlushCurrentSlab(retainSlabOnSmallPayload: true);
+								currentSender = null;
+							}
+
+							eventSender = GetOrCreateCachedSender(address);
+							if (eventSender == null)
+							{
+								asyncEvent.Continuation(null);
+								continue;
+							}
+
+							if (_isStaticAddress)
+							{
+								Interlocked.CompareExchange(ref _fixedSender, eventSender, null);
+								fixedSender = eventSender;
+							}
+							else
+							{
+								eventSender.TouchLastSendTime();
+							}
+						}
 					}
-
-					if (_isStaticAddress && fixedSender == null)
-						fixedSender = eventSender;
-
-					if (currentSender != null && !ReferenceEquals(eventSender, currentSender))
-						FlushCurrentSlab();
 
 					currentSender = eventSender;
 
@@ -1455,7 +1594,7 @@ namespace NLog.Targets
 					var status = TryEncodeIntoSlab(asyncEvent.LogEvent, slab, slabOffset, ref rendered, out int written);
 					if (status == EncodeStatus.SlabFull)
 					{
-						FlushCurrentSlab();
+						FlushCurrentSlab(retainSlabOnSmallPayload: false);
 						slab = ByteBufferPool.Rent(ByteBufferPool.Size64K);
 						status = TryEncodeIntoSlab(asyncEvent.LogEvent, slab, 0, ref rendered, out written);
 					}
@@ -1475,21 +1614,20 @@ namespace NLog.Targets
 					}
 					else // FallbackSingle (> 64KB or > MaxMessageSize)
 					{
-						FlushCurrentSlab();
+						FlushCurrentSlab(retainSlabOnSmallPayload: true);
 						WriteSingleToSender(currentSender, asyncEvent, rendered);
 					}
 				}
 
-				FlushCurrentSlab();
+				FlushCurrentSlab(retainSlabOnSmallPayload: false);
 			}
-			catch
+			finally
 			{
 				if (slab != null)
 				{
 					ByteBufferPool.Return(slab);
 					slab = null;
 				}
-				throw;
 			}
 		}
 

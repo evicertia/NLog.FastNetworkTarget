@@ -767,5 +767,110 @@ namespace NLog.FastNetworkTarget
 				Assert.That(target.ConnectionCount, Is.EqualTo(0));
 			}
 		}
+
+		[Test]
+		public void CloseTarget_WhileDynamicAddressProducerBlockedOnFullQueue_DoesNotDeadlock()
+		{
+			var stalledListener = new TcpListener(IPAddress.Loopback, 0);
+			stalledListener.Start();
+			Socket accepted = null;
+
+			try
+			{
+				int port = ((IPEndPoint)stalledListener.LocalEndpoint).Port;
+				string endpoint = $"tcp4://127.0.0.1:{port}";
+
+				var ctx = CreateTarget("${event-properties:endpoint}", t =>
+				{
+					t.MaxQueueSize = 2;
+					t.SendBufferSize = 1024;
+					t.SendTimeout = 5000;
+					t.OnQueueOverflow = NetworkTargetQueueOverflowAction.Block;
+				});
+
+				var target = ctx.Target;
+				var acceptTask = stalledListener.AcceptSocketAsync();
+
+				var payload = new string('B', 8192);
+				var firstEv = new LogEventInfo(LogLevel.Info, "block", payload);
+				firstEv.Properties["endpoint"] = endpoint;
+				target.WriteAsyncLogEvent(new AsyncLogEventInfo(firstEv, ex => { }));
+
+				Assert.That(acceptTask.Wait(3000), Is.True);
+				accepted = acceptTask.Result;
+				accepted.ReceiveBufferSize = 1024;
+
+				var producerFinished = new ManualResetEvent(false);
+				var producerThread = new Thread(() =>
+				{
+					for (int i = 0; i < 400 && target.BlockedEnqueues == 0; i++)
+					{
+						var ev = new LogEventInfo(LogLevel.Info, "block", payload);
+						ev.Properties["endpoint"] = endpoint;
+						target.WriteAsyncLogEvent(new AsyncLogEventInfo(ev, ex => { }));
+					}
+					producerFinished.Set();
+				})
+				{
+					IsBackground = true
+				};
+				producerThread.Start();
+
+				var sw = System.Diagnostics.Stopwatch.StartNew();
+				while (target.BlockedEnqueues == 0 && sw.ElapsedMilliseconds < 3000)
+					Thread.Sleep(5);
+
+				Assert.That(target.BlockedEnqueues, Is.GreaterThan(0), "Expected dynamic-address producer to block on full queue");
+
+				// CloseTarget must NOT deadlock even while dynamic-address producer is blocked inside EnqueueItem
+				var closeDone = new ManualResetEvent(false);
+				var closeThread = new Thread(() =>
+				{
+					ctx.Dispose();
+					closeDone.Set();
+				})
+				{
+					IsBackground = true
+				};
+				closeThread.Start();
+
+				Assert.That(closeDone.WaitOne(4000), Is.True, "CloseTarget deadlocked while dynamic-address producer was blocked");
+				Assert.That(producerFinished.WaitOne(4000), Is.True, "Blocked producer did not wake up on CloseTarget");
+			}
+			finally
+			{
+				try { accepted?.Close(); } catch { }
+				try { stalledListener.Stop(); } catch { }
+			}
+		}
+
+		[Test]
+		public void MultiChunkBuilder_SurrogatePairAcrossBoundary_EncodesExactBytes()
+		{
+			using (var receiver = new TestTcpReceiver(storeLines: true))
+			using (var ctx = CreateTarget(receiver.Address, t =>
+			{
+				// Compound layout with multiple literal/event properties forces multi-chunk StringBuilder > 4096 chars
+				t.Layout = new SimpleLayout("${event-properties:part1}${event-properties:part2}");
+			}))
+			{
+				// Place high surrogate '\uD83D' at index 4095 (end of first 4096-char buffer/chunk) and low surrogate '\uDE00' at start of part2
+				string part1 = new string('A', 4095) + "\uD83D";
+				string part2 = "\uDE00" + new string('Z', 1000);
+				string expected = new string('A', 4095) + "😀" + new string('Z', 1000);
+
+				var ev = new LogEventInfo(LogLevel.Info, "surrogate", "msg");
+				ev.Properties["part1"] = part1;
+				ev.Properties["part2"] = part2;
+
+				var done = new ManualResetEvent(false);
+				ctx.Target.WriteAsyncLogEvent(new AsyncLogEventInfo(ev, ex => done.Set()));
+				Assert.That(done.WaitOne(3000), Is.True);
+
+				Assert.That(receiver.WaitForMessages(1, TimeSpan.FromSeconds(3)), Is.True);
+				Assert.That(receiver.ReceivedLines.TryDequeue(out var actual), Is.True);
+				Assert.That(actual, Is.EqualTo(expected));
+			}
+		}
 	}
 }

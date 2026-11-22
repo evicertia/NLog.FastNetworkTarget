@@ -1,72 +1,121 @@
 name: CI
 
 on:
-  push:
-    branches: [ master, main ]
-    tags: [ 'v*' ]
   pull_request:
-    branches: [ master, main ]
+    branches:
+      - master
   workflow_dispatch:
-    inputs:
-      publish_nuget:
-        description: 'Publish package to NuGet.org'
-        required: false
-        type: boolean
-        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
-    name: Build & Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ ubuntu-latest, windows-latest ]
+    name: build
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      PACKAGE_VERSION: 2.0.0-ci.${{ github.run_number }}
+      ASSEMBLY_VERSION: 2.0.0.0
+      FILE_VERSION: 2.0.0.${{ github.run_number }}
+      INFORMATIONAL_VERSION: "${{ github.ref_name }}:${{ github.sha }}"
+      PACKAGE_RELEASE_NOTES: "See changes for this revision at: https://github.com/evicertia/NLog.FastNetworkTarget/commit/${{ github.sha }}"
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
-    - name: Setup .NET SDK
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: '8.0.x'
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
 
-    - name: Restore dependencies
-      run: dotnet restore NLog.FastNetworkTarget.sln
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v2
 
-    - name: Build solution (Release)
-      run: dotnet build NLog.FastNetworkTarget.sln -c Release --no-restore
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
 
-    - name: Run .NET 8 Tests
-      run: dotnet test NLog.FastNetworkTarget.Tests/NLog.FastNetworkTarget.Tests.csproj -c Release -f net8.0 --no-build --logger "trx"
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore NLog.FastNetworkTarget.sln -p:NuGetAudit=false
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    - name: Run .NET Framework 4.6.2 Tests (Windows only)
-      if: runner.os == 'Windows'
-      run: dotnet test NLog.FastNetworkTarget.Tests/NLog.FastNetworkTarget.Tests.csproj -c Release -f net462 --no-build --logger "trx"
+      - name: Build
+        shell: pwsh
+        run: |
+          $msbuildArgs = @(
+            "NLog.FastNetworkTarget.sln",
+            "/m",
+            "/p:Configuration=Release",
+            "/p:Platform=Any CPU",
+            "/p:Version=$env:PACKAGE_VERSION",
+            "/p:PackageVersion=$env:PACKAGE_VERSION",
+            "/p:AssemblyVersion=$env:ASSEMBLY_VERSION",
+            "/p:FileVersion=$env:FILE_VERSION",
+            "/p:InformationalVersion=$env:INFORMATIONAL_VERSION",
+            "/p:RepositoryCommit=$env:GITHUB_SHA",
+            "/p:PackageReleaseNotes=$env:PACKAGE_RELEASE_NOTES",
+            "/p:NuGetAudit=false",
+            "/verbosity:minimal"
+          )
+          msbuild @msbuildArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    - name: Upload NuGet Packages
-      if: matrix.os == 'ubuntu-latest'
-      uses: actions/upload-artifact@v4
-      with:
-        name: nuget-packages
-        path: NLog.FastNetworkTarget/bin/Release/*.nupkg
+      - name: Test
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path TestResults -Force | Out-Null
+          dotnet test NLog.FastNetworkTarget.Tests/NLog.FastNetworkTarget.Tests.csproj --configuration Release --no-build --framework net8.0 --logger "trx;LogFileName=net8.0.trx" --results-directory TestResults
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet test NLog.FastNetworkTarget.Tests/NLog.FastNetworkTarget.Tests.csproj --configuration Release --no-build --framework net462 --logger "trx;LogFileName=net462.trx" --results-directory TestResults
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-  publish:
-    name: Publish to NuGet
-    needs: build
-    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) || (github.event_name == 'workflow_dispatch' && inputs.publish_nuget)
-    runs-on: ubuntu-latest
-    steps:
-    - name: Download NuGet Packages
-      uses: actions/download-artifact@v4
-      with:
-        name: nuget-packages
-        path: packages
+      - name: Pack
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path artifacts -Force | Out-Null
+          $packArgs = @(
+            "pack",
+            "NLog.FastNetworkTarget/NLog.FastNetworkTarget.csproj",
+            "--configuration", "Release",
+            "--no-build",
+            "--include-symbols",
+            "-p:SymbolPackageFormat=snupkg",
+            "--output", "artifacts",
+            "-p:Version=$env:PACKAGE_VERSION",
+            "-p:PackageVersion=$env:PACKAGE_VERSION",
+            "-p:AssemblyVersion=$env:ASSEMBLY_VERSION",
+            "-p:FileVersion=$env:FILE_VERSION",
+            "-p:InformationalVersion=$env:INFORMATIONAL_VERSION",
+            "-p:RepositoryCommit=$env:GITHUB_SHA",
+            "-p:PackageReleaseNotes=$env:PACKAGE_RELEASE_NOTES",
+            "-p:NuGetAudit=false"
+          )
+          dotnet @packArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    - name: Setup .NET SDK
-      uses: actions/setup-dotnet@v4
-      with:
-        dotnet-version: '8.0.x'
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: TestResults/**/*.trx
+          if-no-files-found: ignore
 
-    - name: Push to NuGet.org
-      run: dotnet nuget push "packages/*.nupkg" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+          if-no-files-found: error
